@@ -1,0 +1,5 @@
+data/sih/
+localidade.parquet
+*.csv
+
+*.duckdb
