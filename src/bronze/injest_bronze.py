@@ -11,7 +11,7 @@ con.execute("SET SCHEMA 'bronze'")
 sih_path = os.path.join("../../data/sih", "**", "*.parquet").replace("\\", "/")
 
 sih_columns = [
-    'ANO_CMPT', 'UF_ZI', 'MUNIC_RES', 'DIAS_PERM', 'SEXO',
+    'ANO_CMPT', 'UF_ZI', 'DIAS_PERM', 'SEXO',
     'IDADE', 'DIAG_PRINC', 'VAL_SH', 'VAL_TOT', 'US_TOT'
 ]
 columns_str = ", ".join(sih_columns)
@@ -36,9 +36,16 @@ sih_sus_result
 
 # %%
 # Load the localidade file into the bronze schema
+# Convert codigo_ibge_cidade and codigo_uf to varchar
 con.execute(f"""
     CREATE OR REPLACE TABLE bronze.localidade AS
-    SELECT * FROM read_parquet('../../data/localidade.parquet')
+    SELECT
+        CAST(codigo_ibge_cidade AS VARCHAR) AS codigo_ibge_cidade,
+        nome_cidade,
+        CAST(codigo_uf AS VARCHAR) AS codigo_uf,
+        sigla_uf,
+        nome_estado
+    FROM read_parquet('../../data/localidade.parquet')
 """)
 
 localidade_result = con.sql('SELECT * FROM localidade LIMIT 10').df()
