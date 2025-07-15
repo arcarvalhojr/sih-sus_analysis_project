@@ -17,8 +17,9 @@ con.execute("SET SCHEMA 'bronze'")
 con.execute(f"""
     CREATE OR REPLACE TABLE bronze.uf_localidade AS
     SELECT
+        codigo_uf,
         nome_estado,
-        codigo_uf
+        regiao_br
     FROM read_csv_auto('{uf_localidade_path}')
 """)
 
