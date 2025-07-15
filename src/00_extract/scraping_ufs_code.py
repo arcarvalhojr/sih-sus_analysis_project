@@ -32,5 +32,18 @@ df_final = df.rename(columns={"UFs": "nome_estado"}
 df_final
 
 # %%
+# Map the brazilian regions according to the official IBGE rules 
+regions = {
+    '1': 'Norte',
+    '2': 'Nordeste',
+    '3': 'Sudeste',
+    '4': 'Sul',
+    '5': 'Centro-Oeste'
+}
+
+df_final['regiao_br'] = df_final['codigo_uf'].str[0].map(regions)
+df_final
+
+# %%
 df_path = data_dir / "localidade_ufs.csv"
 df_final.to_csv(df_path, index=False, encoding="utf-8-sig")
