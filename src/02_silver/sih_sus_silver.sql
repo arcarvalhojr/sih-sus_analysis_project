@@ -8,15 +8,15 @@ SELECT
     CAST(DIAS_PERM AS SMALLINT) AS length_stay,
 -- Change for more readeble names    
     CASE
-        WHEN SEXO = '1' THEN 'male'
-        WHEN SEXO = '3' THEN 'female'
+        WHEN SEXO IN ('1', 'Masculino') THEN 'Male'
+        WHEN SEXO IN ('3', 'Feminino') THEN 'Female'
         ELSE 'unknown'
     END AS gender,
     CAST(IDADE AS SMALLINT) AS age,
     CAST(DIAG_PRINC AS VARCHAR) AS disease_code,
-    VAL_SH AS amount_paid,
-    VAL_TOT AS total_paid,
-    US_TOT AS us_total_paid
+    CAST(VAL_SH AS DECIMAL(10, 2)) AS amount_paid,
+    CAST(VAL_TOT AS DECIMAL(10, 2)) AS total_paid,
+    CAST(US_TOT AS DECIMAL(10, 2)) AS us_total_paid
 FROM read_parquet('{{data_path}}', union_by_name = True)
 WHERE NOT (
     DIAG_PRINC BETWEEN '080' AND '084' OR
