@@ -14,9 +14,9 @@ SELECT
     END AS gender,
     CAST(IDADE AS SMALLINT) AS age,
     CAST(DIAG_PRINC AS VARCHAR) AS disease_code,
-    CAST(VAL_SH AS DECIMAL(10, 2)) AS amount_paid,
-    CAST(VAL_TOT AS DECIMAL(10, 2)) AS total_paid,
-    CAST(US_TOT AS DECIMAL(10, 2)) AS us_total_paid
+    CAST(VAL_SH AS DECIMAL(13, 2)) AS amount_paid,
+    CAST(VAL_TOT AS DECIMAL(14, 2)) AS total_paid,
+    CAST(US_TOT AS DECIMAL(8, 2)) AS us_total_paid
 FROM read_parquet('{{data_path}}', union_by_name = True)
 WHERE NOT (
     DIAG_PRINC BETWEEN '080' AND '084' OR
