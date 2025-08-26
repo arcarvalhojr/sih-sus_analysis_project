@@ -1,0 +1,977 @@
+---
+title: "Hospitalizations and costs of ambulatory care sensitive conditions in Brazil"
+subtitle: "Exploratory and Data Analysis"
+author: Alexsander R. Carvalho Junior
+date: today
+execute: 
+  warning: false
+format: 
+  html:
+    embed-resources: true 
+    grid: 
+      body-width: 1000px
+toc: true
+bibliography: references.bib
+csl: nature.csl
+---
+
+## Introduction
+### About the data
+
+Ambulatory care sensitive conditions refer to health issues that can be effectively prevented, detected early, treated, and managed through primary health care (APS)[@pereira_condicoes_2014]. In Brazil, the Ministry of Health developed its own list of hospitalizations related to these conditions, known as Hospitalizations for Primary Care Sensitive Conditions (ICSAP)[@alfradique_internacoes_2009; @ministerio_da_saude_portaria_2008].High rates of ICSAP admissions often indicate serious issues with health system access or performance, reflecting potential gaps in preventive care, early diagnosis, or continuity of treatment[@pereira_condicoes_2014]. Beyond the clinical implications, these hospitalizations carry a significant economic burden, with avoidable admissions representing billions in health care expenditures.
+
+### Objective
+
+This exploratory data analysis aims to quantify the clinical and financial impact of ICSAP in the Brazilian SUS from 2014 to 2024, while assessing data quality and identifying inconsistencies to ensure robust insights on primary care gaps and potential cost savings. 
+
+### Methodology
+Hospital Information System (SIH), is an administrative database managed by the Ministry of Health, which also provides the official ICSAP list[@ministerio_da_saude_portaria_2008]. Macro-region data are sourced from the Brazilian Institute of Geography and Statistics (IBGE).
+
+When processing the SIH-SUS data into the silver layer, hospitalizations whose primary diagnosis was related to obstetric causes or childbirth (ICD-10 codes O80–O84) were excluded[@proadess_internacoes_2022].
+
+This document presents descriptive analyses of the percentage of ICSAP admissions and their costs, broken down annually by age group, gender, and Brazilian macro-regions. Results are initially presented for the period 2014–2024, followed by a more detailed look at data from 2024. Additionally, the most frequent ICSAP admissions are analyzed according to their primary diagnoses.
+
+It is important to note that the values presented here may differ from other publications due to specific methodological choices made in this study
+
+### Data contains
+
+The database consists of multiple datasets. Here will be explored data from the `sih_sus` table. 
+
+1. **year**: Year of hospitalization (yyyy).
+2. **state_code**: State code of healthcare provider.
+3. **length_stay**: Number of days spent in hospital.
+4. **gender**: Patient's gender.
+5. **age**: Patient's age (years).
+6. **disease_code**: Code of the principal diagnostic based in the ICD.10.
+7. **amount_paid**: Costs of the hospital services (BR R$).
+8. **total_paid**: Total costs of the hospitalization (BR R$).
+9. **us_total_paid**: Total costs of the hospitalization (US dolars).
+
+## Getting started
+
+The first step is to import all the libraries required for the analysis.
+```{python}
+import duckdb
+from pathlib import Path
+from IPython.display import display
+import pandas as pd
+import matplotlib.pyplot as plt
+import seaborn as sns
+import plotly.express as px
+```
+
+Next, we establish a connection with the database, as the data is stored in a ``DuckDB`` file.
+```{python}
+# Set the file path
+base_dir = Path.cwd().parent.parent
+duckdb_file = base_dir / "sih_sus.duckdb"
+
+# Connect with the database
+con = duckdb.connect(str(duckdb_file))
+```
+
+Then, inspect the dimmension of the ``sih_sus`` dataset, reviewing the first ten rows, column names and types, basic calculations and presence of null vales.
+```{python}
+sih_10 = con.sql("""
+SELECT * FROM silver.sih_sus LIMIT 10
+""").df()
+
+sih_info = con.sql("""
+DESCRIBE silver.sih_sus
+""").df()
+
+sih_summa = con.sql("""
+SUMMARIZE silver.sih_sus
+""").df()
+
+print("First ten roles of the SIH SUS dataset:")
+display(sih_10)
+print("-------------------------------------------------------------")
+
+print("Table atributes:")
+display(sih_info)
+print("-------------------------------------------------------------")
+
+print("SIH SUS data summarization:")
+display(sih_summa.round(2))
+```
+
+
+
+
+The initial exploration reveals some key characteristcs of the dataset. SIH-SUS data contains 134,894,533 entries. Some categorical variables like `year`, `state_code` and `age` are stored as SMALLINT to optimize storage. 
+
+Min and Max values for the `year`, `lenght_stay` and `age` columns suggests that SIH-SUS  covers data from 2014 to 2024, that some individual were admitted and discharged at the same day (0 values) and that the data covers a range (0 to 99) of individuals from newborn to elderly. Also, the null_percentage is 0.0 for all columns. The maximum value of 364 days spent shows that there are very long-term hospitalizations in the `sih_sus` dataset, which is expected but worth verifying. 
+
+The Min value of 0 for `amount_paid` and `total_cost` is interesting but may not be an error because some scenarios can be recorded as having zero cost, as such:
+
+*  If the main payment is registered on the first AIH, subsequent monthly records might appear with a cost of zero.
+*  When a patient is transferred between hospitals
+*  When certain procedures or administrative adjustments within the system might not have a direct cost associated with them but still generate a record. 
+
+
+We can count the number of entries with a length of 364 days of stay and with zero cost.
+```{python}
+sih_count_364_stay = con.sql("""
+SELECT COUNT(*)
+FROM silver.sih_sus
+WHERE length_stay = 364
+""").to_df().iloc[0,0]
+
+sih_count_zero_cost = con.sql("""
+SELECT COUNT(*)
+FROM silver.sih_sus
+WHERE total_paid = 0
+""").to_df().iloc[0,0]
+
+print(f"There are {sih_count_364_stay} entries registered with a length of 364 days of stay.")
+print(f"There are {sih_count_zero_cost} entries registered with zero cost.")
+
+sih_364_stay = con.sql("""
+SELECT *
+FROM silver.sih_sus
+WHERE length_stay = 364
+""").df()
+
+display(sih_364_stay)
+print("------------------------------------------------------------------")
+
+sih_zero_cost = con.sql("""
+SELECT *
+FROM silver.sih_sus
+WHERE total_paid = 0
+LIMIT 10
+""").to_df()
+
+display(sih_zero_cost)
+```
+
+
+It seems that the entries registered with a length of 364 days of stay are valid, since they are distributed across different years, ages and genders. 
+
+However, there are  many entries registered with zero cost. What can be done about it? For most of analyses that involve calculating averages or sums of costs, it's a good practice to filter these records out to avoid distorting the results.
+
+
+## Exploratory analysis
+
+The next step is to explore and analyze ICSAP profiles and costs within SIH-SUS by join with the ``cid10_icsap`` table.
+
+
+#### ICSAP Metrics By Year (2014 to 2024)
+
+How have primary care-sensitive hospitalizations and costs evolved over the last ten years?
+```{python}
+# Query the results
+# Counting totals
+sih_sus_count_year = con.sql("""
+SELECT
+    sih.year,
+    COUNT(*) AS total_hospitalizations,
+    COUNT(CASE
+              WHEN icsap.avoidable_disease_code IS NOT NULL THEN 1
+          END) AS total_icsap,
+    ROUND(COUNT(CASE
+                    WHEN icsap.avoidable_disease_code IS NOT NULL THEN 1
+                END) * 100.0 / COUNT(*), 2) AS rate_icsap
+FROM silver.sih_sus AS sih
+LEFT JOIN silver.cid10_icsap AS icsap
+    ON sih.disease_code = icsap.avoidable_disease_code
+WHERE sih.total_paid > 0
+GROUP BY sih.year
+ORDER BY sih.year
+""").to_df()
+
+# Calculating overall costs by year
+sih_sus_costs_year = con.sql("""
+SELECT
+    sih.year,
+    SUM(sih.total_paid) AS total_cost,
+    SUM(CASE
+            WHEN icsap.avoidable_disease_code IS NOT NULL THEN sih.total_paid
+        END) AS icsap_cost,
+    ROUND(SUM(CASE
+                  WHEN icsap.avoidable_disease_code IS NOT NULL THEN sih.total_paid
+                  ELSE 0
+              END) * 100.0 / SUM(sih.total_paid), 2) AS rate_icsap
+FROM silver.sih_sus AS sih
+LEFT JOIN silver.cid10_icsap AS icsap
+    ON sih.disease_code = icsap.avoidable_disease_code
+WHERE sih.total_paid > 0
+GROUP BY sih.year
+ORDER BY sih.year
+""").to_df()
+```
+
+```{python}
+#| code-fold: true
+#| label: fig-count-cost-year
+#| fig-cap: "Hospitalizations and Cost by Year"
+#| fig-subcap: 
+#|   - "Percent of ICSAP Over Total Hospitalizations by year"
+#|   - "ICSAP Total Cost by Year"
+#| layout-ncol: 2
+
+# Create plot
+sns.set_theme(style="white", palette="colorblind")
+# Bar plot
+fig, ax = plt.subplots()
+
+sns.barplot(
+    data=sih_sus_count_year,
+    x="year", y="rate_icsap",
+    ax=ax
+)
+ax.bar_label(ax.containers[0], fmt='%.1f%%', fontsize=9, color='black', fontweight='bold')
+ax.spines[['right', 'top', 'left']].set_visible(False)
+ax.yaxis.set_visible(False)
+ax.set_xlabel("")
+plt.show()
+
+# Currency formatter function
+def format_brl(value):
+    if value >= 1e9:
+        return f"R${value / 1e9:.2f}B"
+    elif value >= 1e6:
+        return f"R${value / 1e6:.1f}M"
+    else:
+        return f"R${value:,.0f}"
+
+# Horizontal bar plot
+year_order = sorted(sih_sus_count_year["year"].unique(), reverse=True)
+df_year_sorted = sih_sus_costs_year.set_index("year").loc[year_order].reset_index()
+
+fig, ax = plt.subplots()
+
+sns.barplot(
+    data=df_year_sorted,
+    x="icsap_cost", y="year",
+    orient='h',
+    ax=ax, order=year_order
+)
+
+# Format values for bar labels
+formatted_values = [format_brl(v) for v in df_year_sorted["icsap_cost"]]
+
+ax.bar_label(ax.containers[0], labels=formatted_values, padding=-65, fontsize=9, color='white', fontweight='bold')
+ax.spines[['right', 'top', 'bottom']].set_visible(False)
+ax.xaxis.set_visible(False)
+ax.set_ylabel("")
+plt.show()
+```
+
+
+
+From 2014 to 2024, Brazil experienced a gradual decline in the proportion of avoidable hospitalizations (ICSAP) relative to total hospitalizations, dropping from 9.2% in 2014 to 7.81% in 2024. The absolute number of ICSAP cases remained relatively stable over the years.
+
+In terms of financial impact, ICSAP-related costs followed a similar pattern: while their share of total hospitalization costs fluctuated between 5.25% and 5.79%, the absolute ICSAP cost rose significantly, reaching over R$1.2 billion in 2024.
+
+
+#### ICSAP Metrics By year and Brazilian Macro-regions
+
+To add a regional perspective, we join the dataset with the `uf_localidade` table, which contains information about Brazil’s macro-regions.
+```{python}
+sih_sus_regional = con.sql("""
+SELECT
+    sih.year,
+    uf.big_region_name,
+    COUNT(*) AS total_hospitalizations,
+    COUNT(CASE 
+              WHEN cid.avoidable_disease_code IS NOT NULL THEN 1 
+          END) AS avoidable_disease_hosp,
+    ROUND(COUNT(CASE 
+                    WHEN cid.avoidable_disease_code IS NOT NULL THEN 1 
+                END) * 100.0 / COUNT(*), 2) AS tx_avoidable_disease,
+
+    ROUND(SUM(sih.total_paid)) AS total_cost,
+    ROUND(SUM(CASE 
+                  WHEN cid.avoidable_disease_code IS NOT NULL THEN sih.total_paid
+                  ELSE 0 
+              END), 2) AS avoidable_disease_cost,
+    ROUND(SUM(CASE 
+                  WHEN cid.avoidable_disease_code IS NOT NULL THEN sih.total_paid
+                  ELSE 0 
+              END) * 100.0 / SUM(sih.total_paid), 2) AS tx_avoidable_disease_cost 
+
+FROM silver.sih_sus AS sih
+LEFT JOIN silver.cid10_icsap AS cid
+    ON sih.disease_code = cid.avoidable_disease_code
+LEFT JOIN silver.uf_localidade AS uf
+    ON sih.state_code = uf.state_code
+GROUP BY sih.year, uf.big_region_name
+ORDER BY sih.year, uf.big_region_name
+""").to_df()
+```
+
+```{python}
+#| code-fold: true
+#| label: fig-regions
+#| fig-cap: "Percent of Avoidable Hospitalizations and Costs by Brazilian Macro-Regions"
+#| fig-subcap: 
+#|   - "ICSAP (2014 to 2024)"
+#|   - "ICSAP Costs (2014 to 2024)"
+#| layout-ncol: 2
+
+# Create plot
+sns.set_theme(style="whitegrid", palette="colorblind")
+
+# Bar plot
+fig, ax = plt.subplots(figsize=(10, 6))
+
+sns.barplot(
+    data=sih_sus_regional,
+    x="year",
+    y="tx_avoidable_disease",
+    hue="big_region_name", 
+    ax=ax
+)
+ax.spines[['right', 'top']].set_visible(False)
+ax.set_ylabel("ICSAP (%)")
+ax.set_xlabel("")
+ax.legend(title=None, loc="upper center", bbox_to_anchor=(0.5, 1.15), ncol=5)
+plt.tight_layout()
+plt.show()
+
+# Line Plot
+fig, ax = plt.subplots(figsize=(10, 6))
+sns.lineplot(
+    data=sih_sus_regional,
+    x="year", y="tx_avoidable_disease_cost",
+    hue="big_region_name",
+    marker="o",
+    ax=ax
+)
+ax.set_ylabel("ICSAP Cost (%)")
+ax.set_xlabel("")
+ax.set_xticks(sorted(sih_sus_regional["year"].unique()))
+ax.set_xticklabels(sorted(sih_sus_regional["year"].unique()))
+ax.legend(title=None, loc="upper center", bbox_to_anchor=(0.5, 1.15), ncol=5)
+plt.tight_layout()
+plt.show()
+```
+
+
+
+
+The North consistently shows the highest ICSAP rates — above 9% annually — indicating structural challenges in primary care access. The Northeast follows closely, with high volumes and cost shares, reflecting its large population and uneven healthcare coverage. Meanwhile, the South and Southeast maintain lower ICSAP rates and cost proportions, though the Southeast still incurs the highest absolute costs due to its  large population and hospitalization scale. The Centro-Oeste region remains intermediate in both metrics.
+
+Over time, most regions show a gradual decline in ICSAP rates, yet the financial burden remains substantial, with avoidable costs exceeding R$500 million annually in the Southeast alone.
+
+
+#### ICSAP Metrics by the Last Year (2024)
+
+Focusing on 2024, we analyze ICSAP by region, city, age group, and gender.
+```{python}
+con.sql("""
+SELECT COUNT(*)
+FROM silver.sih_sus as sih
+LEFT JOIN silver.cid10_icsap AS cid
+    ON sih.disease_code = cid.avoidable_disease_code
+LEFT JOIN silver.uf_localidade AS uf
+    ON sih.state_code = uf.state_code
+WHERE sih.year = 2024 
+    AND sih.total_paid > 0
+    AND cid.avoidable_disease_code IS NOT NULL
+""").show()
+```
+
+
+As the dataset reduced to 1.103,177 rows (about 99%) we will query the data into a ``Pandas`` dataframe and continuing with filters and aggregations.
+```{python}
+# Query the data
+sih_icsap_2024 = con.sql("""
+SELECT
+    uf.big_region_name,
+    uf.state_name,
+    sih.length_stay,
+    sih.gender,
+    sih.age,
+    icsap.disease_category,
+    sih.total_paid
+FROM silver.sih_sus as sih
+LEFT JOIN silver.cid10_icsap AS icsap
+    ON sih.disease_code = icsap.avoidable_disease_code
+LEFT JOIN silver.uf_localidade AS uf
+    ON sih.state_code = uf.state_code
+WHERE sih.year = 2024
+    AND icsap.avoidable_disease_code IS NOT NULL
+    AND sih.total_paid > 0
+""").to_df()
+
+# Data summary
+def column_summary(df):
+    summary_data = []
+
+    for col_name in df.columns:
+        col_dtype = df[col_name].dtype
+        num_of_nulls = df[col_name].isnull().sum()
+        num_of_non_nulls = df[col_name].notnull().sum()
+        num_of_distinct_values = df[col_name].nunique()
+
+        summary_data.append({
+            'col_name': col_name,
+            'col_dtype': col_dtype,
+            'num_of_nulls': num_of_nulls,
+            'num_of_non_nulls': num_of_non_nulls,
+            'num_of_distinct_values': num_of_distinct_values
+        })
+    
+    summary_df = pd.DataFrame(summary_data)
+    return summary_df
+
+summary_df = column_summary(sih_icsap_2024)
+
+print("Summary of the data:")
+display(summary_df)
+
+print("------------------------------------------------------------------------")
+
+describe_df = sih_icsap_2024.describe()
+print("Descriptive statistic of the data:")
+display(describe_df)
+```
+
+
+
+
+Overall, the data reveals high heterogeneity in both cost and clinical profiles, with strong variability across hospitalizations.
+
+The dataset has no missing values. It spans five macro-regions, 27 states, and includes 19 disease categories. The total_paid variable shows high variability, with over 214,000 distinct values and a wide range from R$21.98 to R$167,924.50. The average hospitalization cost is approximately R$1,129.61, but the standard deviation is more than twice that (R$2,678.28), indicating a highly skewed distribution with probably substantial outliers.
+
+Length_stay also exhibits variability, with a mean of 6 days and a standard deviation of 7 days. While most hospitalizations are short (median of 4 days), some extend up to 343 days, suggesting the presence of complex or chronic cases. The average age is 51 years, and the interquartile range (29 to 74) reflects a concentration of adult and elderly patients.
+
+Thus, the statistic suggest that while most cases are relatively short and moderately costly, a subset of patients drives up the average. 
+
+So, we can analyse if this could be related due to expanded stays and or age group.
+
+
+#### Total Hospitalizations and Costs
+
+First, make a copy of the dataset and create an age group.
+```{python}
+# Make a copy of the data
+df = sih_icsap_2024.copy()
+
+#Create an age group
+bins = [-1, 4, 14, 24, 44, 64, float('inf')]
+labels = ['0-4', '5-14', '15-24', '25-44', '45-64', '65+']
+df['age_group'] = pd.cut(df['age'], bins=bins, labels=labels, right=True)
+
+df
+```
+
+
+
+
+We can analyse the relationship between lenght of stay and the total cost and visualize the distribution of the age groups by doing a scatter plot.
+```{python}
+# Get a sample of the data
+sample_df = df.sample(n=100000, random_state=42)
+
+```
+
+```{python}
+#| code-fold: true
+#| label: fig-scatter
+#| fig-cap: "Analysis of the relationship between cost and length of stay"
+#| fig-subcap: 
+#|   - "ICSAP Cost vs Length of Stay by Age Group (2024)"
+#|   - "ICSAP Cost vs Length of Stay by Age Group (2024) - Filtered"
+#| layout-nrow: 2
+
+# Create plot
+sns.set_theme(style="whitegrid", palette="colorblind")
+
+g = sns.relplot(
+    data=sample_df,
+    x='length_stay', y='total_paid',
+    col='age_group', hue='gender', col_wrap=3,
+    kind='scatter', height=4, aspect=1.2, alpha=0.5 
+)
+sns.move_legend(
+    g, "upper center",
+    bbox_to_anchor=(.5, 1.0), 
+    ncol=2, title=None, frameon=False
+)
+g.set_axis_labels("Length of Stay (Days)", "Total Cost (R$)")
+g.set_titles("Age Group: {col_name}")
+plt.tight_layout(rect=[0, 0, 1, 0.97])
+plt.show()
+
+# We can filter the data to lenght stays equal or less then 100 days and
+# costs equal or less then 60K for better visualization
+filtered_df = sample_df[
+    (sample_df["length_stay"] <= 100) &
+    (sample_df["total_paid"] <= 60000)
+]
+
+g = sns.relplot(
+    data=filtered_df,
+    x='length_stay', y='total_paid',
+    col='age_group', hue='gender', col_wrap=3,
+    kind='scatter', height=4, aspect=1.2, alpha=0.5 
+)
+sns.move_legend(
+    g, "upper center",
+    bbox_to_anchor=(.5, 1.0), 
+    ncol=2, title=None, frameon=False
+)
+g.set_axis_labels("Length of Stay (Days)", "Total Cost (R$)")
+g.set_titles("Age Group: {col_name}")
+plt.tight_layout(rect=[0, 0, 1, 0.97])
+plt.show()
+```
+
+
+
+
+There doesn't appear to be a clear relationship between length of stay and total cost. We observe both short hospitalizations with high costs and long stays with either high or low costs.
+
+Both age groups are represented across the spectrum, but individuals aged 65+ and 45–64 seem to have a higher concentration of cases with elevated costs and/or extended durations.
+
+The presence of extreme values and wide interquartile ranges suggests that while most hospitalizations are moderately priced, a subset incurs significantly higher costs.
+
+
+Now, we can analyse the statistic grouped by age group and gender to see the patterms.
+```{python}
+summary_gender = df.groupby(["gender"])["total_paid"].describe().round(2)
+
+summary_age = df.groupby(["age_group"])["total_paid"].describe().round(2)
+
+display(summary_gender)
+display(summary_age)
+```
+
+
+```{python}
+#| code-fold: true
+#| label: fig-count-grouped
+#| fig-cap: "Total Hospitalizations by Gender and Age Group"
+#| fig-subcap: 
+#|   - "ICSAP by Gender (2024)"
+#|   - "ICSAP by Age Group (2024)"
+#| layout-ncol: 2
+
+# Counting the total of hospitalizations
+# By gender
+count_gender = df.groupby(["gender"]).size().reset_index(name='total_hospitalizations')
+# By age group
+count_age_group = df.groupby(["age_group"]).size().reset_index(name='total_hospitalizations')
+
+# Create the plots
+sns.set_theme(style="white", palette="colorblind")
+
+# Bar plot for gender
+fig, ax = plt.subplots()
+
+sns.barplot(
+    data=count_gender,
+    x="gender", y="total_hospitalizations",
+    hue='gender',
+    ax=ax
+)
+for container in ax.containers:
+    ax.bar_label(container, fontsize=9, color='black', fontweight='bold')
+ax.spines[['right', 'top']].set_visible(False)
+ax.set_ylabel("Total Hospitalizations")
+ax.set_xlabel("")
+plt.show()
+
+# Bar plot for age group
+fig, ax = plt.subplots()
+
+sns.barplot(
+    data=count_age_group,
+    x="age_group", y="total_hospitalizations",
+    hue='age_group',
+    ax=ax
+)
+for container in ax.containers:
+    ax.bar_label(container, fontsize=9, color='black', fontweight='bold')
+ax.spines[['right', 'top']].set_visible(False)
+ax.set_ylabel("Total Hospitalizations")
+ax.set_xlabel("")
+plt.show()
+```
+
+```{python}
+#| code-fold: true
+#| label: fig-costs-grouped
+#| fig-cap: "Total Cost by Gender and Age Group"
+#| fig-subcap: 
+#|   - "ICSAP Cost by Gender (2024)"
+#|   - "ICSAP Cost by Gender (2024) - Without outs"
+#|   - "ICSAP Cost by Age Group (2024)"
+#|   - "ICSAP Cost by Age Group (2024) - Without outs"
+#| layout-ncol: 2
+#| layout-nrow: 2
+
+# Create the plots
+sns.set_theme(style="whitegrid", palette="colorblind")
+
+# Gender
+fig, ax = plt.subplots()
+
+sns.boxplot(data=sample_df, x='gender', y='total_paid', hue='gender')
+ax.set_ylabel("Total Cost (R$)")
+ax.set_xlabel("")
+plt.show()
+
+# Gender no outliers
+fig, ax = plt.subplots()
+
+sns.boxplot(
+    data=sample_df, 
+    x='gender', y='total_paid', hue='gender',
+    showfliers=False # Hide outliers
+) 
+ax.set_ylabel("Total Cost (R$)")
+ax.set_xlabel("")
+plt.show()
+
+# Age group
+fig, ax = plt.subplots()
+
+sns.boxplot(data=sample_df, x='age_group', y='total_paid', hue='age_group')
+ax.set_ylabel("Total Cost (R$)")
+ax.set_xlabel("")
+plt.show()
+
+# Age group filtered
+fig, ax = plt.subplots()
+
+sns.boxplot(
+    data=sample_df,
+     x='age_group', y='total_paid', hue='age_group',
+     showfliers=False # Hide outliers
+)
+ax.set_ylabel("Total Cost (R$)")
+ax.set_xlabel("")
+plt.show()
+```
+
+
+
+For gender, males have a higher average cost (R$1,205.09) compared to females (R$1,055.84), and also a higher standard deviation (R$2,802.83 vs. R$2,548.52), indicating greater dispersion in male hospitalization expenses. Both genders share the same minimum cost (R$21.98), but males reach a higher maximum (R$167,924.52), suggesting the presence of extreme outliers.
+
+When analyzing age groups, hospitalization costs tend to increase with age. Children aged 0–4 and 5–14 have the lowest average costs , while adults aged 45–64 and seniors 65+ show the highest averages. The standard deviation also grows with age, reflecting more variability in older populations.
+
+
+
+We also can have a look in those patterms by macro-regions wiht the metrics agrouped by gender and age group.
+```{python}
+# Prepare data
+# Metrics agrouoed by gender
+df_region_gender = df.groupby(['big_region_name', 'gender']).size().reset_index(name='total_hospitalizations')
+
+df_region_gender_cost = (df.groupby(['big_region_name', 'gender'])
+      .agg(total_cost=('total_paid', 'sum'))
+      .sort_values(by='big_region_name', ascending=False)
+      .reset_index()
+)
+
+# Metrics agrouped by age group
+df_region_age = df.groupby(['big_region_name', 'age_group']).size().reset_index(name='total_hospitalizations')
+
+df_region_age_cost = (df.groupby(['big_region_name', 'age_group'])
+      .agg(total_cost=('total_paid', 'sum'))
+      .sort_values(by='big_region_name', ascending=False)
+      .reset_index()
+)
+```
+
+```{python}
+#| code-fold: true
+#| label: fig-region-gender
+#| fig-cap: "Total Hospitalizations and Costs by Macro-Regions and Gender"
+#| fig-subcap: 
+#|   - "ICSAP Hospitalizations (2024)"
+#|   - "ICSAP Cost (2024)"
+#| layout-ncol: 2
+
+# Define the order
+region_order = (
+    df.groupby('big_region_name')['total_paid']
+      .sum()
+      .sort_values(ascending=False)
+      .index
+)
+
+# Create plot
+sns.set_theme(style="whitegrid", palette="colorblind")
+# For gender count
+fig, ax = plt.subplots(figsize=(10, 6))
+
+sns.barplot(
+    data=df_region_gender,
+    x='big_region_name', y='total_hospitalizations',
+    hue='gender',
+    ax=ax, order=region_order
+)
+for container in ax.containers:
+    ax.bar_label(container, fontsize=9, color='black', fontweight='bold')
+ax.spines[['right', 'top', 'left']].set_visible(False)
+ax.legend(title=None, loc="upper center", bbox_to_anchor=(0.5, 1.15), ncol=2)
+ax.yaxis.set_visible(False)
+ax.set_xlabel("")
+plt.show()
+
+# For gender cost
+fig, ax = plt.subplots(figsize=(10, 6))
+
+sns.barplot(
+    data=df_region_gender_cost,
+    x='big_region_name', y='total_cost', hue='gender',
+    ax=ax, order=region_order, width=0.9
+)
+for container in ax.containers:
+    values = container.datavalues
+    labels = [format_brl(v) for v in values]
+    ax.bar_label(container, labels=labels, fontsize=9, color='black', fontweight='bold')
+ax.spines[['right', 'top', 'left']].set_visible(False)
+ax.legend(title=None, loc="upper center", bbox_to_anchor=(0.5, 1.15), ncol=2)
+ax.set_ylabel("")
+ax.yaxis.set_visible(False)
+plt.show()
+```
+
+
+```{python}
+#| code-fold: true
+#| label: fig-region-age
+#| fig-cap: "Total Hospitalizations and Costs by Macro-Regions and Age Group"
+#| fig-subcap: 
+#|   - "ICSAP Hospitalizations (2024)"
+#|   - "ICSAP Cost (2024)"
+#| layout-ncol: 2
+
+# Define the order
+region_order = (
+    df.groupby('big_region_name')['total_paid']
+      .sum()
+      .sort_values(ascending=False)
+      .index
+)
+age_group_order = (
+    df.groupby('age_group')['total_paid']
+      .sum()
+      .sort_values(ascending=False)
+      .index
+)
+
+# Create plot
+sns.set_theme(style="whitegrid", palette="colorblind")
+
+# For age group count
+fig, ax = plt.subplots(figsize=(10, 8))
+
+sns.barplot(
+    data=df_region_age,
+    x='total_hospitalizations', y='big_region_name',
+    orient='h', hue='age_group', hue_order=age_group_order,
+    ax=ax, order=region_order
+)
+for container in ax.containers:
+    ax.bar_label(container, fontsize=9, color='black', fontweight='bold')
+ax.spines[['right', 'top', 'bottom']].set_visible(False)
+ax.legend(title=None, loc="upper center", bbox_to_anchor=(0.5, 1.15), ncol=6)
+ax.xaxis.set_visible(False)
+ax.set_ylabel("")
+plt.show()
+
+# For age group cost
+fig, ax = plt.subplots(figsize=(10, 8))
+
+sns.barplot(
+    data=df_region_age_cost,
+    x='total_cost', y='big_region_name',
+    orient='h', hue='age_group', hue_order=age_group_order,
+    ax=ax, order=region_order
+)
+for container in ax.containers:
+    values = container.datavalues
+    labels = [format_brl(v) for v in values]
+    ax.bar_label(container, labels=labels, fontsize=9, color='black', fontweight='bold')
+ax.spines[['right', 'top', 'bottom']].set_visible(False)
+ax.legend(title=None, loc="upper center", bbox_to_anchor=(0.5, 1.15), ncol=6)
+ax.xaxis.set_visible(False)
+ax.set_ylabel("")
+plt.show()
+```
+
+
+
+
+Across Brazil’s major regions, hospitalization patterns reveal consistent gender and age-related trends. The Southeast region recorded the highest number of hospitalizations overall, with male patients slightly outnumbering females. This male predominance was also observed in the South and North, whereas the Northeast and Center-West showed higher hospitalization counts among females.
+
+Older adults (65+) accounted for the largest share of hospitalizations in every region, particularly in the Southeast (196,559) and Northeast (124,967). The 45–64 age group followed closely.
+
+Cost data mirrored these patterns. The Southeast incurred the highest total hospitalization costs for both genders. When broken down by age group, the 65+ population consistently drove the highest costs across all regions, peaking in the Southeast at over R$259 million. The 45–64 group also contributed substantially, reinforcing the financial impact of aging populations on the healthcare system.
+
+
+#### ICSAP Disease Categories
+
+Let's look at the avoidable disease categories, the main categories and their expenditures.
+```{python}
+disease_category = (
+    df.groupby('disease_category')
+      .agg(total_hospitalizations=('disease_category', 'size'),
+           total_cost=('total_paid', 'sum'),
+           avg_cost=('total_paid', 'mean'),
+           avg_stay=('length_stay', 'mean'))
+      .sort_values(by='total_hospitalizations', ascending=False)
+)
+styled_tb = (
+    disease_category.style
+    .background_gradient(cmap='YlGnBu', high=0.2, subset=['total_cost', 'avg_cost', 'avg_stay'])
+    .format({'total_cost': 'R$ {:,.2f}'})
+)
+
+styled_tb
+
+```
+
+
+
+
+While urinary tract infections top the list in volume, cerebrovascular diseases dominate in total cost, exceeding R$365 million despite fewer admissions. Bacterial pneumonia and diabetes mellitus also represent high-burden conditions, combining frequent hospitalizations with substantial expenditures.
+
+Interestingly, some conditions—such as heart failure and angina—stand out for their elevated cost per hospitalization. Heart failure, with just over 26,000 admissions, incurred more than R$71 million in costs, while angina, with only 1,132 cases, generated over R$5.3 million.
+
+Immunization-preventable conditions still account for over 23,000 hospitalizations and R$46 million in costs — highlighting gaps in preventive coverage.
+
+```{python}
+
+# Identify the 3 categories with the most hospitalizations
+top3_categories = df['disease_category'].value_counts().nlargest(3).index.tolist()
+
+# Filter the data
+df_top3 = df[df['disease_category'].isin(top3_categories)].copy()
+```
+
+```{python}
+#| code-fold: true
+#| label: fig-top3-cost
+#| fig-cap: "Total Cost and Length of Stay Distribution by Age Group"
+#| fig-subcap: 
+#|   - "ICSAP Total Cost Distribution (2024)"
+#|   - "ICSAP Length of Stay Distribution (2024)"
+#| layout-nrow: 2
+
+# Create plot
+sns.set_theme(style="whitegrid", palette="colorblind")
+
+# For total cost
+c = sns.catplot(
+    data=df_top3,
+    x='age_group', y='total_paid', hue='age_group',
+    col='disease_category',
+    kind='box', col_wrap=3, 
+    showfliers=False # Hide outliers
+)
+c.set_axis_labels("", "Total Cost (R$)")
+c.set_titles("{col_name}")
+plt.show()
+
+# For length stay
+s = sns.catplot(
+    data=df_top3,
+    x='age_group', y='length_stay', hue='age_group',
+    col='disease_category',
+    kind='box', col_wrap=3,
+    showfliers=False # Hide outliers
+)
+s.set_axis_labels("", "Length of Stay (Days)")
+s.set_titles("{col_name}")
+plt.show()
+```
+
+
+```{python}
+# Total hosp and cost by macro-regions
+treemap_data = df.groupby(['big_region_name', 'disease_category']).agg(
+    total_hospitalizations=('disease_category', 'size'),
+    total_cost=('total_paid', 'sum')
+).sort_values('total_hospitalizations', ascending=False).reset_index()
+
+treemap_top5 = treemap_data.groupby('big_region_name').head(5)
+
+# Get Brazil top disease category
+top_category_brasil = df['disease_category'].value_counts().idxmax()
+br_top_hosp = (df['disease_category'] == top_category_brasil).sum()
+br_top_cost = df.loc[df['disease_category'] == top_category_brasil, 'total_paid'].sum()
+
+root_label = f"Brazil - 2024"
+```
+
+```{python}
+#| code-fold: true
+#| label: fig-top5-regions
+#| fig-cap: Top 5 ICSAP Disaese Categories by Macro-Regions (2024)
+
+# Create plot
+# Treemap plot
+fig_treemap = px.treemap(
+    treemap_top5,
+    path=[px.Constant(root_label), 'big_region_name', 'disease_category'],
+    values='total_hospitalizations',
+    color='total_cost',
+    color_continuous_scale='YlGnBu',
+    custom_data=['total_cost'],
+    labels={'total_cost': 'Total Cost'}
+)
+default_hover = (
+    "<b>%{label}</b><br>"
+    "Total Hospitalizations: %{value:,d}<br>"
+    "Total Cost: R$ %{customdata[0]:,.2f}<extra></extra>"
+)
+fig_treemap.update_traces(hovertemplate=default_hover)
+
+labels = list(fig_treemap.data[0]['labels'])
+root_idx = labels.index(root_label)  # o índice do nó raiz
+hovertemplates = [default_hover] * len(labels)
+hovertemplates[root_idx] = (
+    f"<b>{root_label}</b><br>"
+    f"Brazil Top Disease Category: <b>{top_category_brasil}</b><br>"
+    f"Total Hospitalizations: {br_top_hosp:,d}<br>"
+    f"Total Cost: R$ {br_top_cost:,.2f}<extra></extra>"
+)
+fig_treemap.data[0].hovertemplate = hovertemplates
+fig_treemap.update_layout(margin=dict(t=50, l=25, r=25, b=25))
+fig_treemap.show()
+```
+
+
+
+
+## Conclusions
+
+About the dataset:
+
+*  **Dataset size and structure**: The SIH-SUS dataset is very large; therefore, it is more efficient to run queries that aggregate information before importing the data into Power BI.
+
+* **Data quality issues**: 
+    + Missing data is minimal, but there are records with zero cost that need filtering for financial analyses.
+    + Both cost and length of stay show high variability and skewness, indicating that averages can be influenced by a small subset of complex cases.
+
+About the data:
+
+*  **Gradual reduction in ICSAP**: The proportion of hospitalizations for primary care–sensitive conditions in the SUS decreased between 2014 and 2024 (from 9.2% to 7.8%), suggesting some improvements, though the absolute number of cases remained stable.
+
+*  **Significant financial impact**: Despite the proportional reduction, absolute costs increased, surpassing R$1.2 billion in 2024, indicating that remaining cases are potentially more complex and costly.
+
+*  **Marked regional differences**:
+     + The North and Northeast maintain higher ICSAP rates, reflecting possible gaps in primary care access and coverage.
+     + The Southeast accounts for the highest absolute costs and hospitalizations due to its larger population.
+
+*  **Age and gender profiles**: Older adults (45–64 and 65+) account for most hospitalizations and costs, reinforcing the impact of population aging.
+
+*  **Costs and length of stay**: Maybe there is no direct relationship between days of hospitalization and cost, as expenses may depend on several factors beyond duration, including the type and complexity of treatment (e.g., surgeries, ICU), medications and supplies, comorbidities and others. Thus, short stays can be expensive, while some long stays may involve relatively low costs.
+
+*  **Main disease categories**:
+     + Urinary tract infections lead in admission volume.
+     + Cerebrovascular diseases generate the highest total costs.
+     + Bacterial pneumonia, diabetes mellitus, and heart failure also have a significant impact.
+     + Vaccine-preventable conditions still account for over 23,000 admissions, highlighting gaps in preventive coverage.
+
+
+## References
