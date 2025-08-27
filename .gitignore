@@ -1,4 +1,4 @@
-data/sih/
+data/raw/sih/
 localidade.parquet
 *.csv
 
