@@ -38,5 +38,6 @@ LEFT JOIN silver.cid10_icsap AS cid
     ON sih.disease_code = cid.avoidable_disease_code
 LEFT JOIN silver.uf_localidade AS uf
     ON sih.state_code = uf.state_code
+WHERE sih.total_paid > 0
 GROUP BY sih.year, uf.big_region_name
 ORDER BY sih.year, uf.big_region_name
