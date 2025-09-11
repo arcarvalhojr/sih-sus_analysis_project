@@ -1,0 +1,654 @@
+---
+execute: 
+  warning: false
+  echo: false
+format: 
+  html:
+    embed-resources: true 
+    grid: 
+      body-width: 1000px
+---
+
+::: {.content-hidden}
+### Import necessary libraries & load data
+:::
+
+```{python}
+import duckdb
+from pathlib import Path
+import pandas as pd
+import matplotlib.pyplot as plt
+from matplotlib.ticker import FuncFormatter
+from matplotlib.colors import Normalize
+from matplotlib.colors import to_rgb
+from pypalettes import load_cmap
+import seaborn as sns
+import geopandas as gpd
+import geobr
+import unicodedata
+```
+
+```{python}
+# Set the file path
+base_dir = Path.cwd().parent.parent
+duckdb_file = base_dir / "sih_sus.duckdb"
+
+# Connect with the database
+con = duckdb.connect(str(duckdb_file))
+```
+
+::: {.content-hidden}
+### Query & Fetch data into tables
+
+#### Counting totals and calculating the overall cost by year
+```{python}
+sih_sus_year = con.sql("""
+SELECT
+    sih.year,
+    COUNT(CASE
+              WHEN icsap.avoidable_disease_code IS NOT NULL THEN 1
+          END) AS total_icsap_hosp,
+    ROUND(COUNT(CASE
+                    WHEN icsap.avoidable_disease_code IS NOT NULL THEN 1
+                END) * 100.0 / COUNT(*), 2) AS rate_icsap_hosp,
+    ROUND(COUNT(CASE
+                    WHEN icsap.avoidable_disease_code IS NULL THEN 1
+                END) * 100.0 / COUNT(*), 2) AS rate_hosp,
+    SUM(CASE
+            WHEN icsap.avoidable_disease_code IS NOT NULL THEN sih.total_paid
+        END) AS total_icsap_cost
+FROM silver.sih_sus AS sih
+LEFT JOIN silver.cid10_icsap AS icsap
+    ON sih.disease_code = icsap.avoidable_disease_code
+WHERE sih.total_paid > 0
+GROUP BY sih.year
+ORDER BY sih.year
+""").to_df()
+sih_sus_year
+```
+
+
+#### Total ICSAP hosp by BR region & states
+```{python}
+sih_sus_2024_map = con.sql("""
+SELECT
+    uf.big_region_name,
+    uf.state_name,
+    COUNT(CASE
+                    WHEN icsap.avoidable_disease_code IS NOT NULL THEN 1
+                END) AS total_icsap_hosp,
+    ROUND(COUNT(CASE
+                    WHEN icsap.avoidable_disease_code IS NOT NULL THEN 1
+                END) * 100.0 / COUNT(*), 2) AS rate_icsap_hosp
+FROM silver.sih_sus AS sih
+LEFT JOIN silver.cid10_icsap AS icsap
+    ON sih.disease_code = icsap.avoidable_disease_code
+LEFT JOIN silver.uf_localidade AS uf
+    ON sih.state_code = uf.state_code
+WHERE sih.year = 2024
+    AND sih.total_paid > 0
+GROUP BY uf.big_region_name, uf.state_name
+ORDER BY uf.big_region_name
+""").to_df()
+sih_sus_2024_map
+```
+
+
+#### Top5 disease category
+```{python}
+sih_icsap_top5 = con.sql("""
+WITH ranked AS (
+    SELECT
+        sih.year,
+        icsap.disease_category,
+        COUNT(*) AS total_hosp,
+        ROW_NUMBER() OVER (
+            PARTITION BY sih.year
+            ORDER BY COUNT(*) DESC
+        ) AS rn
+    FROM silver.sih_sus AS sih
+    LEFT JOIN silver.cid10_icsap AS icsap
+        ON sih.disease_code = icsap.avoidable_disease_code
+    WHERE sih.year IN (2014, 2024)
+      AND icsap.avoidable_disease_code IS NOT NULL
+      AND sih.total_paid > 0
+    GROUP BY sih.year, icsap.disease_category
+)
+SELECT *
+FROM ranked
+WHERE rn <= 5
+ORDER BY year, total_hosp DESC
+""").to_df()
+sih_icsap_top5
+```
+
+
+#### Top10 disease category cost
+```{python}
+sih_icsap_top10 = con.sql("""
+SELECT
+    icsap.disease_category,
+    ROUND(SUM(sih.total_paid), 2) AS total_cost
+FROM silver.sih_sus AS sih
+LEFT JOIN silver.cid10_icsap AS icsap
+    ON sih.disease_code = icsap.avoidable_disease_code
+WHERE sih.year = 2024
+    AND icsap.avoidable_disease_code IS NOT NULL
+    AND sih.total_paid > 0
+GROUP BY icsap.disease_category
+ORDER BY total_cost DESC
+LIMIT 10
+""").to_df()
+sih_icsap_top10
+```
+:::
+
+::: {.content-hidden}
+### Report body
+:::
+## ICSAP in Brazil (2014–2024): Regional Inequalities and Rising Costs.
+
+Hospitalizations for primary care sensitive conditions (ICSAP) reflect access quality of health services. High rates of ICSAPs could reveal gaps in the health services and generate major public and economic impacts due to avoidable hospitalizations and costs.
+
+
+
+
+### Why do ICSAP costs keep increasing despite lower hospitalization rates?
+
+
+::::: {layout="[70, 30]"}
+::: {#firstcolumn}
+
+```{python}
+# Colors
+colors = {
+    "ICSAP Hospitalizations": "#2166ac", 
+    "Others": "#d0d1e6" 
+}
+
+fig, ax = plt.subplots(figsize=(10, 4))
+
+# Base bar: not ICSAP
+bars_total = ax.bar(
+    data=sih_sus_year,
+    x='year', height='rate_hosp',
+    label="Others",
+    color=colors["Others"]
+)
+
+# ICSAP bar
+bars_icsap = ax.bar(
+    data=sih_sus_year,
+    x='year', height='rate_icsap_hosp',
+    bottom=sih_sus_year["rate_hosp"],
+    label="ICSAP Hospitalizations",
+    color=colors["ICSAP Hospitalizations"]
+)
+
+# Bars label for ICSAP only
+ax.bar_label(
+    bars_icsap,
+    labels=[f"{v:.1f}%" if v > 5 else "" for v in sih_sus_year["rate_icsap_hosp"]],
+    label_type="center",
+    fontsize=10,
+    color="white",
+    fontweight="bold"
+)
+
+ax.set_ylabel("")
+ax.set_xticks(sih_sus_year["year"])
+ax.set_yticks(range(0, 101, 20))
+ax.tick_params(axis="y", length=0) 
+ax.tick_params(axis="x", labelsize=11)
+ax.spines[['right', 'top', 'left']].set_visible(False)
+ax.set_axisbelow(True)  
+ax.yaxis.grid(True, linestyle="--", alpha=0.5)
+ax.legend(title=None, loc="upper center", bbox_to_anchor=(0.5, 1.07), ncol=2, frameon=False)
+
+# Title and subtitle
+ax.text(x=0.05, y=.97, s="Hospitalization Rate by Year in Brazil", transform=fig.transFigure, ha='left', fontsize=13, weight='bold', alpha=.6)
+ax.text(x=0.05, y=.93, s="Evolution of ICSAP rate in the Brazilian SUS from 2014 to 2024", transform=fig.transFigure, ha='left', fontsize=9, alpha=.7)
+
+plt.tight_layout()
+plt.show()
+```
+:::
+::: {#secondcolumn}
+From 2014 to 2019, ICSAP hospitalizations remained above 1 million per year, accounting for **around 9%** of all hospital admissions. The 2020–2021 period saw a sharp drop in ICSAP hospitalizations, largely due to COVID-19 disruptions in access to care. In the following years, admissions rose again, approaching pre-pandemic levels, though they now account for a **slightly smaller share** of all hospitalizations.
+:::
+:::::
+
+
+::: {layout="[30, 70]"}
+
+Despite the relative decline in ICSAP admissions, costs have steadily increased over time.
+- Between 2014 and 2019, annual expenditures already exceeded BRL 800 million.
+- From 2022 onward, costs surpassed BRL 1 billion per year, reaching about **BRL 1.25 billion in 2024**.
+This highlights that, even with lower proportional rates, ICSAP still generate a growing economic burden for the health system.
+
+```{python}
+# Currency BR format
+def format_brl(value, pos=None):
+    if value >= 1e9:
+        return f"R${value / 1e9:.2f}B"
+    elif value >= 1e6:
+        return f"R${value / 1e6:.0f}M"
+    else:
+        return f"R${value:,.0f}"
+
+# Line plot
+years = sih_sus_year["year"]
+values = sih_sus_year["total_icsap_cost"]
+
+fig, ax = plt.subplots(figsize=(10, 4))
+
+ax.plot(
+    years, values,
+    marker="o",
+    linestyle="-",
+    color="#2166ac"
+)
+
+# Add fill area
+ax.fill_between(
+    years, values,
+    values.min(), 
+    color="#2166ac",
+    alpha=0.2 
+)
+
+ax.set_xlabel("")
+ax.set_ylabel("")
+ax.grid(True, linestyle="--", alpha=0.4)
+ax.yaxis.set_major_formatter(FuncFormatter(format_brl))
+ax.tick_params(axis="y", length=0) 
+ax.tick_params(axis="x", length=0) 
+ax.tick_params(axis="x", labelsize=11)
+ax.spines[['right', 'top', 'left', 'bottom']].set_visible(False)
+ax.grid(True, linestyle="--", alpha=0.5)
+
+# Add specific label for x axis on the figure
+for year, value in [(years.iloc[0], values.iloc[0]), (years.iloc[-1], values.iloc[-1])]:
+    ax.annotate(
+        format_brl(value, None),
+        xy=(year, value),             
+        xytext=(0, 10),                
+        textcoords="offset points",    
+        ha="center", va="bottom",
+        fontsize=12, fontweight="bold", color="#2166ac"
+    )
+
+# Tilte and subtitle
+ax.text(x=0.05, y=.95, s="Hospitalization Cost by Year in Brazil", transform=fig.transFigure, ha='left', fontsize=13, weight='bold', alpha=.6)
+ax.text(x=0.05, y=.91, s="Evolution of ICSAP cost in the Brazilian SUS from 2014 to 2024", transform=fig.transFigure, ha='left', fontsize=9, alpha=.7)
+
+plt.tight_layout()
+plt.show()
+```
+:::
+
+***
+
+### ICSAP rates remain highly unequal across regions.
+
+
+
+::: {layout="[20, 80]"}
+
+- North & Northeast concentrate most of the states with rates **above 9%**, pointing to challenges in primary care access and effectiveness.
+- **Roraima** (13.5%), **Maranhão** (12.1%), and **Pará** (10.4%) show the greatest burden of ICSAP hospitalizations.
+- Despite higher absolute numbers, Southeast & South presents comparatively lower rates.
+
+```{python}
+# Prepare data for the map plot
+# Load Brazilian states geometries (2019 version)
+states = geobr.read_state(year=2019)
+
+# Function to normalize names (remove accents and lowercase)
+def clean_name(name):
+    if isinstance(name, str):
+        nfkd = unicodedata.normalize("NFKD", name)
+        only_ascii = "".join([c for c in nfkd if not unicodedata.combining(c)])
+        return only_ascii.lower().strip()
+    return name
+
+# Clean names in both datasets for a reliable merge
+states["name_state_clean"] = states["name_state"].apply(clean_name)
+sih_sus_2024_map["state_name_clean"] = sih_sus_2024_map["state_name"].apply(clean_name)
+
+# Format large numbers into readable labels (K, M)
+def abr_format(num):
+    if num >= 1_000_000:
+        return f"{num/1_000_000:.1f}M"
+    elif num >= 1_000:
+        return f"{num/1_000:.0f}K"
+    else:
+        return str(num)
+
+# Apply abbreviation to hospitalizations column
+sih_sus_2024_map["total_hosp_fmt"] = sih_sus_2024_map["total_icsap_hosp"].apply(abr_format)
+
+# Merge geodataframe (states polygons) with hospitalization dataset
+gdf = states.merge(
+    sih_sus_2024_map,
+    left_on="name_state_clean",
+    right_on="state_name_clean",
+    how="left"
+)
+
+# Compute centroids of states (to position labels on the map later)
+gdf["centroid"] = gdf.geometry.centroid
+
+# Prepare data for the bar plot
+# Define bins (categories) for hospitalization rates
+bins = [5, 7, 8, 9, 11, 15]
+labels = ["5–7%", "7–8%", "8–9%", "9–11%", ">11%"]
+
+# Step 2: Copy a simplified dataset
+atlas = gdf[["rate_icsap_hosp", "total_icsap_hosp"]].copy()
+
+# Cut data based on the bins
+atlas["group_rate"] = pd.cut(atlas["rate_icsap_hosp"], bins=bins, labels=labels, include_lowest=True)
+
+# Aggregate total hospitalizations per group
+pop_rate = atlas.groupby("group_rate", observed=True)["total_icsap_hosp"].sum().reset_index()
+
+# Compute share (%) of each group relative to total
+pop_rate["share"] = (pop_rate["total_icsap_hosp"] / pop_rate["total_icsap_hosp"].sum()) * 100
+
+# Format share as percentage for labeling
+pop_rate["label"] = pop_rate["share"].round(1).astype(str) + "%"
+```
+
+```{python}
+# Load color palette 
+palette_name = "YlGnBu"
+cmap = load_cmap(palette_name, cmap_type="continuous")
+
+# Normalize color scale based on hospitalization rates
+norm = Normalize(vmin=gdf["rate_icsap_hosp"].min(), vmax=gdf["rate_icsap_hosp"].max())
+
+# Decide text color based on background luminance
+def get_text_color_from_bg(rgb_tuple):
+    luminance = (0.299 * rgb_tuple[0] + 0.587 * rgb_tuple[1] + 0.114 * rgb_tuple[2])
+    return "white" if luminance < 0.5 else "black"
+
+# Create map plot
+fig, ax = plt.subplots(figsize=(12, 10))
+ax.axis("off")
+
+gdf.plot(
+    ax=ax,
+    column="rate_icsap_hosp",
+    cmap=cmap,
+    edgecolor="grey",
+    alpha=0.9
+)
+
+# adaptive  map labels (state abbreviation + total hospitalizations)
+for idx, row in gdf.iterrows():
+    value = row["rate_icsap_hosp"]
+    rgb_color = cmap(norm(value))
+    text_color = get_text_color_from_bg(rgb_color[:3])
+
+    if row["centroid"] is not None and not row.isnull().any():
+        x, y = row["centroid"].coords[0]
+        label = f"{row['abbrev_state']}\n{row['total_hosp_fmt']}"
+
+        ax.text(
+            x, y, label,
+            ha="center", va="center",
+            fontsize=7, fontweight="bold",
+            color=text_color
+        )
+
+# Add inset barplot
+mini_ax = ax.inset_axes(bounds=(0.25, 0.18, 0.10, 0.25), transform=fig.transFigure)
+mini_ax.axis("off")
+
+bar_plot = sns.barplot(
+    data=pop_rate,
+    x='share',
+    y='group_rate',
+    palette=palette_name, 
+    ax=mini_ax,
+    hue='group_rate',
+    legend=False
+)
+
+mini_ax.axvline(x=0, color="black")
+mini_ax.invert_yaxis()  # Flip y-axis 
+
+# Define which groups get labels outside the bars
+group_label_out = [">11%", "8–9%", "7–8%"]
+
+# Add percentage labels on bars
+for p, group in zip(mini_ax.patches, pop_rate["group_rate"]):
+    width = p.get_width()
+    y = p.get_y() + p.get_height() / 2
+
+    # Define label position and text color
+    if group in group_label_out:
+        x_pos = width + 1     # outside the bar
+        align = "left"
+        color = "black"
+    else:
+        x_pos = width - 2     # inside the bar
+        align = "right"
+        face_color = p.get_facecolor()[:3]  
+        color = get_text_color_from_bg(face_color)
+
+    # Add % label
+    mini_ax.text(
+        x_pos, y,
+        f"{width:.1f}%",
+        va="center",
+        ha=align,
+        fontsize=11,
+        color=color,
+        fontweight="bold"
+    )
+
+    # Add group label
+    mini_ax.text(
+        -20, y,
+        group,
+        color="black",
+        size=8,
+        va="center"
+    )
+
+
+# Add fig titles
+fig.text(x=0.5, y=0.88, s="Regional Inequalities in Avoidable Hospitalizations in Brazil, 2024", transform=fig.transFigure, ha="center", size=12, weight="bold", alpha=.6)
+fig.text(x=0.5, y=0.86, s="State-level hospitalization rates", transform=fig.transFigure, ha="center", size=9, alpha=.7)
+
+fig.text(x=0.17, y=0.44, s="Share of hospitalizations by rate", size=10, alpha=.7)
+
+plt.show()
+```
+:::
+
+***
+
+### From lower to high-cost conditions: why ICSAP expenses keep growing.
+
+
+
+
+:::: {.column-page-inset}
+::: {layout="[40, 60]"}
+
+```{python}
+# prepare data
+top5_pivot = sih_icsap_top5.pivot(index="disease_category", columns="year", values="total_hosp")
+top5_pivot = top5_pivot.sort_values(2014, ascending=False)
+
+# Format large numbers into readable labels
+def abr_format_2(num):
+    if pd.isna(num):
+        return ""
+    if num >= 100_000:
+        return f"{num/1000:.0f}K" 
+    else:
+        return str(int(num))
+
+# Format large names
+def break_label(label):
+    return label.replace(" e ", "\n e ")
+
+# Adjust disease category labels position (only for left side)
+label_adjustments = {
+    "Diabetes melitus": -3000,
+    "Infecção no Rim e Trato Urinário": +2000,
+    "Pneumonias bacterianas": 0,
+}
+
+# ploting
+years = [2014, 2024]
+fig, ax = plt.subplots(figsize=(6, 5))
+
+# linhas verticais guia
+ax.axvline(x=years[0], color='black', linestyle='--', linewidth=1.25)
+ax.axvline(x=years[1], color='black', linestyle='--', linewidth=1.25)
+
+# slope chart
+for disease in top5_pivot.index:
+    v0 = top5_pivot.at[disease, 2014]
+    v1 = top5_pivot.at[disease, 2024]
+
+    color = "#0c2c84" if v1 > v0 else "#c7e9b4"
+
+    ax.plot(years, [v0, v1], marker="o", color=color, linewidth=2.5)
+
+    # apply x axis label adjustment 
+    adj0 = label_adjustments.get(disease, 0)
+
+    # left label (2014)
+    ax.text(
+        years[0] - 0.3, v0 + adj0,
+        f"{break_label(disease)} ({abr_format_2(v0)})",
+        ha="right", va="center", fontsize=9
+    )
+
+    # right label (2024)
+    ax.text(
+        years[1] + 0.3, v1,
+        abr_format_2(v1),
+        ha="left", va="center", fontsize=9, fontweight="bold"
+    )
+
+# Year labels
+ax.text(2014, -0.03, "2014", transform=ax.get_xaxis_transform(),
+        ha="center", va="top", fontsize=11)
+ax.text(2024, -0.03, "2024", transform=ax.get_xaxis_transform(),
+        ha="center", va="top", fontsize=11)
+
+
+ax.set_xticks([2014, 2024])
+ax.set_xticklabels(["", ""])
+ax.set_ylabel("")
+ax.set_yticks([])
+ax.tick_params(axis="x", length=0)
+
+# remove spines
+for s in ["top", "bottom", "left", "right"]:
+    ax.spines[s].set_visible(False)
+
+# Title and subtitle
+ax.text(x=0.05, y=0.96, s="How the Leading Categories of ICSAP's Have Changed in Brazil", transform=fig.transFigure, ha="left", size=10, weight="bold", alpha=.6)
+ax.text(x=0.05, y=0.93, s="From 2014 to 2024, some conditions rose while others declined", transform=fig.transFigure, ha="left", size=8, alpha=.7)
+
+plt.tight_layout()
+plt.show()
+```
+
+
+```{python}
+# Currency BR format
+def format_brl_2(value):
+    if value >= 1e6:
+        return f"R${value / 1e6:.0f}M"
+    else:
+        return f"R${value:,.0f}"
+
+# Disease categories for highlight
+highlight = {
+    "Doenças Cerebrovasculares",
+    "Pneumonias bacterianas",
+    "Diabetes melitus",
+    "Infecção no Rim e Trato Urinário",
+    "Gastroenterites Infecciosas e complicações"
+}
+
+# Prepare data
+top10_cost = sih_icsap_top10.copy()
+top10_cost = top10_cost.sort_values(by="total_cost", ascending=True)
+
+# Apply break_label nos rótulos do eixo Y
+top10_cost["disease_category_fmt"] = top10_cost["disease_category"].apply(break_label)
+
+# Colors
+colors = top10_cost["disease_category"].apply(
+    lambda x: "#0c2c84" if x in highlight else "#d0d1e6"
+)
+
+# Plot
+fig, ax = plt.subplots(figsize=(10, 5))
+
+bars = ax.barh(
+    top10_cost["disease_category_fmt"],
+    top10_cost["total_cost"],
+    color=colors,
+    height=0.6
+)
+
+# Bar labels
+for bar, value, disease in zip(bars, top10_cost["total_cost"], top10_cost["disease_category"]):
+    label = format_brl_2(value)
+    width = bar.get_width()
+
+    if width > top10_cost["total_cost"].max() * 0.15:
+        # inside the bar
+        ax.text(
+            width - (width * 0.01),
+            bar.get_y() + bar.get_height() / 2,
+            label,
+            ha="right", va="center",
+            color="white" if disease in highlight else "black",
+            fontsize=9, fontweight="bold"
+        )
+    else:
+        # outside the bar
+        ax.text(
+            width + (top10_cost["total_cost"].max() * 0.01),
+            bar.get_y() + bar.get_height() / 2,
+            label,
+            ha="left", va="center",
+            color="black", fontsize=9, fontweight="bold"
+        )
+
+ax.spines[["right", "top", "bottom"]].set_visible(False)
+ax.grid(axis="x", linestyle="--", alpha=0.5)
+ax.set_axisbelow(True)
+ax.xaxis.tick_top()
+ax.tick_params(axis="x", labeltop=True, labelbottom=False)
+ax.xaxis.set_major_formatter(FuncFormatter(lambda x, _: "" if x == 0 else format_brl_2(x)))
+ax.tick_params(axis="x", length=0) 
+ax.set_ylabel("")
+ax.tick_params(axis="y", labelsize=10)
+ax.tick_params(axis="x", labelsize=9)
+
+# Tiltle and subtiltle
+ax.text(x=0.05, y=0.96, s="Hospitalization Costs of the 10 Leading ICSAP's (Brazil, 2024)", transform=fig.transFigure, ha="left", size=11, weight="bold", alpha=.6)
+ax.text(x=0.05, y=0.93, s="Cerebrovascular diseases topped the ranking of hospitalization costs.", transform=fig.transFigure, ha="left", size=8, alpha=.7)
+
+plt.tight_layout()
+plt.show()
+```
+:::
+::::
+
+In 2014, the leading cause of ICSAP hospitalizations was infectious gastroenteritis (204k cases), a condition generally associated with lower treatment costs. After ten years, however, the profile of admissions had shifted: urinary tract infections (218k), **cerebrovascular diseases** (198k), and bacterial pneumonia (169k) became the most common causes. Unlike gastroenteritis, these conditions are among the most expensive categories of ICSAP. Cerebrovascular diseases alone accounted for more than **BRL 360 million** in 2024, followed by bacterial pneumonias with BRL 243 million.
+
+This shift in the composition of hospitalizations helps explain why overall ICSAP costs continue to rise, even as the relative hospitalization rate has declined over the last decade.
