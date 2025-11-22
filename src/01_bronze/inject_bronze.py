@@ -48,12 +48,11 @@ con.execute(f"""
 
 # %%
 # Read tables from sih_dictionary
-sheets = ["LEITOS", "NATUREZA JURÍDICA", "NÍVEL DE ATENÇAO"]
+sheets = ["LEITOS", "NÍVEL DE ATENÇAO"]
 
 tables = pd.read_excel(sih_dictionary_path, sheet_name=sheets)
 sheet_names = {
     "LEITOS": "sih_bed_speciality",
-    "NATUREZA JURÍDICA": "sih_legal_nature",
     "NÍVEL DE ATENÇAO": "sih_complexity"
 }
 
