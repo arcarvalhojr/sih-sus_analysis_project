@@ -35,17 +35,23 @@ It is important to note that the values presented here may differ from other pub
 
 ### Data contains
 
-The database consists of multiple datasets. Here will be explored data from the `sih_sus` table. 
+The database consists of multiple datasets. Here will be explored data from the ``sih_sus`` table. 
 
-1. **year**: Year of hospitalization (yyyy).
-2. **state_code**: State code of healthcare provider.
-3. **length_stay**: Number of days spent in hospital.
-4. **gender**: Patient's gender.
-5. **age**: Patient's age (years).
-6. **disease_code**: Code of the principal diagnostic based in the ICD.10.
-7. **amount_paid**: Costs of the hospital services (BR R$).
-8. **total_paid**: Total costs of the hospitalization (BR R$).
-9. **us_total_paid**: Total costs of the hospitalization (US dolars).
+1. **id_hospitalization**: Id number of the hospitalization.
+2. **year**: Year of hospitalization (yyyy).
+3. **month**: Month of the hospitalization (mm).
+4. **state_code**: State code of healthcare provider.
+5. **length_stay**: Number of days spent in hospital.
+6. **gender**: Subject's gender.
+7. **age**: Subject's age (years).
+8. **race_color_code**: Code for the Race/color of the subject.
+9. **disease_code**: Code of the principal diagnostic based in the ICD-10.
+10. **hospitalization_type_code**: Code of the type of hospitalization.
+11. **complexity_code**: Code for the hospitalization complexity.
+12. **bed_speciality_code**: Code of the hospitalization bed speciality.
+13. **requested_procedure_code**: Code for the requested procedure.
+14. **total_cost**: Total costs of the hospitalization (BR R$).
+15. **death_flag**: Indicate subject death.
 
 ## Getting started
 
@@ -98,8 +104,7 @@ display(sih_summa.round(2))
 
 
 
-
-The initial exploration reveals some key characteristcs of the dataset. SIH-SUS data contains 134,894,533 entries. Some categorical variables like `year`, `state_code` and `age` are stored as SMALLINT to optimize storage. 
+The initial exploration reveals some key characteristcs of the dataset. SIH-SUS dataset contains 120,119,838 records across eleven years but with 26,081,632 non unique values for `id_hospitalization` code. This need to be checked!  
 
 Min and Max values for the `year`, `lenght_stay` and `age` columns suggests that SIH-SUS  covers data from 2014 to 2024, that some individual were admitted and discharged at the same day (0 values) and that the data covers a range (0 to 99) of individuals from newborn to elderly. Also, the null_percentage is 0.0 for all columns. The maximum value of 364 days spent shows that there are very long-term hospitalizations in the `sih_sus` dataset, which is expected but worth verifying. 
 
@@ -110,46 +115,140 @@ The Min value of 0 for `amount_paid` and `total_cost` is interesting but may not
 *  When certain procedures or administrative adjustments within the system might not have a direct cost associated with them but still generate a record. 
 
 
-We can count the number of entries with a length of 364 days of stay and with zero cost.
+Let's have a look into some duplicated `id_hospitalization` 
 ```{python}
-sih_count_364_stay = con.sql("""
-SELECT COUNT(*)
+some_duplicates = con.sql("""
+SELECT
+    id_hospitalization,
+    COUNT(*) AS total_duplicates
 FROM silver.sih_sus
-WHERE length_stay = 364
-""").to_df().iloc[0,0]
-
-sih_count_zero_cost = con.sql("""
-SELECT COUNT(*)
-FROM silver.sih_sus
-WHERE total_paid = 0
-""").to_df().iloc[0,0]
-
-print(f"There are {sih_count_364_stay} entries registered with a length of 364 days of stay.")
-print(f"There are {sih_count_zero_cost} entries registered with zero cost.")
-
-sih_364_stay = con.sql("""
-SELECT *
-FROM silver.sih_sus
-WHERE length_stay = 364
+WHERE year = 2014 AND state_code = 35
+GROUP BY ALL
+HAVING COUNT(*) > 1
+LIMIT 10
 """).df()
 
-display(sih_364_stay)
-print("------------------------------------------------------------------")
-
-sih_zero_cost = con.sql("""
-SELECT *
-FROM silver.sih_sus
-WHERE total_paid = 0
-LIMIT 10
-""").to_df()
-
-display(sih_zero_cost)
+some_duplicates
 ```
 
 
-It seems that the entries registered with a length of 364 days of stay are valid, since they are distributed across different years, ages and genders. 
+The ids vary in number of repetitions. We need to be sure they are not just an error. So let's search for duplicates in Rio de Janeiro state at 2023, as an example, based on the `id_hospitalization`, `month`, `age`, `gender`, `disease_code`, `length_stay` and `total_cost`. 
+```{python}
+sih_dups = con.sql("""
+SELECT
+    id_hospitalization,
+    month,
+    age,
+    gender,
+    disease_code,
+    length_stay,
+    total_cost
+FROM silver.sih_sus
+WHERE year = 2023 AND state_code = 33
+QUALIFY COUNT(*) OVER (PARTITION BY id_hospitalization) > 1
+ORDER BY id_hospitalization, age DESC, total_cost DESC
+LIMIT 20
+""").df()
 
-However, there are  many entries registered with zero cost. What can be done about it? For most of analyses that involve calculating averages or sums of costs, it's a good practice to filter these records out to avoid distorting the results.
+sih_dups
+```
+
+
+Apparently is not an error because they happen all in different months. We can look if the same `id_hospitalization` repeats over the years and if it has the same pattern. 
+```{python}
+sih_dups_years = con.sql("""
+SELECT
+    id_hospitalization,
+    year,
+    month,
+    age,
+    gender,
+    disease_code,
+    length_stay,
+    total_cost
+FROM silver.sih_sus
+WHERE state_code = 33 AND id_hospitalization = '3308100738350' 
+ORDER BY id_hospitalization, year, month 
+""").df()
+display(sih_dups_years.head(20))
+
+sih_dups_years['year'].value_counts().sort_index()
+```
+
+
+It looks like the same patern repeat over the years, therefore can be a continuos treatment/hospitalization.
+
+But, if more than one identical record per month happens it is an error! Let's check.
+```{python}
+some_real_dups = con.sql("""
+SELECT
+    id_hospitalization,
+    month,
+    disease_code,
+    length_stay,
+    total_cost,
+    COUNT(*) AS total_duplicates
+FROM silver.sih_sus
+WHERE year = 2023 AND state_code = 33
+GROUP BY ALL
+HAVING COUNT(*) > 1
+ORDER BY month
+LIMIT 10
+""").df()
+
+some_real_dups
+```
+
+
+Yes, there are some identical records per month, so they need to be filtered out before the analysis.
+
+Now let's have a look for the number of records with a length of 364 days and the ones with zero cost
+
+```{python}
+sih_364_stay = con.sql("""
+WITH unique_obs AS (
+    SELECT DISTINCT
+        id_hospitalization,
+        gender,
+        age,
+        state_code,
+        month,
+        disease_code,
+        length_stay,
+        total_cost
+    FROM silver.sih_sus
+)
+SELECT *
+FROM unique_obs
+WHERE length_stay = 364;
+""").df()
+
+sih_zero_cost = con.sql("""
+WITH unique_obs AS (
+    SELECT DISTINCT
+        id_hospitalization,
+        year,
+        month,
+        disease_code,
+        length_stay,
+        total_cost
+    FROM silver.sih_sus
+)
+SELECT *
+FROM unique_obs
+WHERE total_cost = 0
+""").df()
+
+print(f"There are {sih_364_stay.shape[0]} observations recorded with 364 days of stay.")
+print(f"There are {sih_zero_cost.shape[0]} observations recorded with zero cost.")
+
+display(sih_364_stay)
+```
+
+
+It seems that hospitalizations recorded with a length of 364 days of stay are valid, since they are distributed across different gender, ages, month and brazilian state. 
+
+However, there are  many entries recorded with cost equal to zero. I do not have enough information about the system to know if these records are valid or an error or anything else, so I will filter them out for further analysis.
 
 
 ## Exploratory analysis
