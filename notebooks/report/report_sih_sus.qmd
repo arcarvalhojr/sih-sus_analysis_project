@@ -45,22 +45,17 @@ con = duckdb.connect(str(duckdb_file))
 sih_sus_year = con.sql("""
 SELECT
     sih.year,
-    COUNT(CASE
-              WHEN icsap.avoidable_disease_code IS NOT NULL THEN 1
-          END) AS total_icsap_hosp,
-    ROUND(COUNT(CASE
-                    WHEN icsap.avoidable_disease_code IS NOT NULL THEN 1
-                END) * 100.0 / COUNT(*), 2) AS rate_icsap_hosp,
+    COUNT(icsap.avoidable_disease_code) AS total_icsap_hosp,
+    ROUND(COUNT(icsap.avoidable_disease_code) * 100.0 / COUNT(*), 2) AS rate_icsap_hosp,
     ROUND(COUNT(CASE
                     WHEN icsap.avoidable_disease_code IS NULL THEN 1
                 END) * 100.0 / COUNT(*), 2) AS rate_hosp,
     SUM(CASE
-            WHEN icsap.avoidable_disease_code IS NOT NULL THEN sih.total_paid
+            WHEN icsap.avoidable_disease_code IS NOT NULL THEN sih.total_cost
         END) AS total_icsap_cost
-FROM silver.sih_sus AS sih
+FROM silver.sih_sus_eda_clean AS sih
 LEFT JOIN silver.cid10_icsap AS icsap
     ON sih.disease_code = icsap.avoidable_disease_code
-WHERE sih.total_paid > 0
 GROUP BY sih.year
 ORDER BY sih.year
 """).to_df()
@@ -74,19 +69,14 @@ sih_sus_2024_map = con.sql("""
 SELECT
     uf.big_region_name,
     uf.state_name,
-    COUNT(CASE
-                    WHEN icsap.avoidable_disease_code IS NOT NULL THEN 1
-                END) AS total_icsap_hosp,
-    ROUND(COUNT(CASE
-                    WHEN icsap.avoidable_disease_code IS NOT NULL THEN 1
-                END) * 100.0 / COUNT(*), 2) AS rate_icsap_hosp
-FROM silver.sih_sus AS sih
+    COUNT(icsap.avoidable_disease_code) AS total_icsap_hosp,
+    ROUND(COUNT(icsap.avoidable_disease_code) * 100.0 / COUNT(*), 2) AS rate_icsap_hosp
+FROM silver.sih_sus_eda_clean AS sih
 LEFT JOIN silver.cid10_icsap AS icsap
     ON sih.disease_code = icsap.avoidable_disease_code
 LEFT JOIN silver.uf_localidade AS uf
     ON sih.state_code = uf.state_code
 WHERE sih.year = 2024
-    AND sih.total_paid > 0
 GROUP BY uf.big_region_name, uf.state_name
 ORDER BY uf.big_region_name
 """).to_df()
@@ -106,12 +96,11 @@ WITH ranked AS (
             PARTITION BY sih.year
             ORDER BY COUNT(*) DESC
         ) AS rn
-    FROM silver.sih_sus AS sih
+    FROM silver.sih_sus_eda_clean AS sih
     LEFT JOIN silver.cid10_icsap AS icsap
         ON sih.disease_code = icsap.avoidable_disease_code
     WHERE sih.year IN (2014, 2024)
       AND icsap.avoidable_disease_code IS NOT NULL
-      AND sih.total_paid > 0
     GROUP BY sih.year, icsap.disease_category
 )
 SELECT *
@@ -128,13 +117,12 @@ sih_icsap_top5
 sih_icsap_top10 = con.sql("""
 SELECT
     icsap.disease_category,
-    ROUND(SUM(sih.total_paid), 2) AS total_cost
-FROM silver.sih_sus AS sih
+    ROUND(SUM(sih.total_cost), 2) AS total_cost
+FROM silver.sih_sus_eda_clean AS sih
 LEFT JOIN silver.cid10_icsap AS icsap
     ON sih.disease_code = icsap.avoidable_disease_code
 WHERE sih.year = 2024
     AND icsap.avoidable_disease_code IS NOT NULL
-    AND sih.total_paid > 0
 GROUP BY icsap.disease_category
 ORDER BY total_cost DESC
 LIMIT 10
@@ -206,7 +194,7 @@ ax.yaxis.grid(True, linestyle="--", alpha=0.5)
 ax.legend(title=None, loc="upper center", bbox_to_anchor=(0.5, 1.07), ncol=2, frameon=False)
 
 # Title and subtitle
-ax.text(x=0.05, y=.97, s="Hospitalization Rate by Year in Brazil", transform=fig.transFigure, ha='left', fontsize=13, weight='bold', alpha=.6)
+ax.text(x=0.05, y=.97, s="Hospitalization Rate by Year in Brazil", transform=fig.transFigure, ha='left', fontsize=13, weight='bold', alpha=.8)
 ax.text(x=0.05, y=.93, s="Evolution of ICSAP rate in the Brazilian SUS from 2014 to 2024", transform=fig.transFigure, ha='left', fontsize=9, alpha=.7)
 
 plt.tight_layout()
@@ -279,7 +267,7 @@ for year, value in [(years.iloc[0], values.iloc[0]), (years.iloc[-1], values.ilo
     )
 
 # Tilte and subtitle
-ax.text(x=0.05, y=.95, s="Hospitalization Cost by Year in Brazil", transform=fig.transFigure, ha='left', fontsize=13, weight='bold', alpha=.6)
+ax.text(x=0.05, y=.95, s="Hospitalization Cost by Year in Brazil", transform=fig.transFigure, ha='left', fontsize=13, weight='bold', alpha=.8)
 ax.text(x=0.05, y=.91, s="Evolution of ICSAP cost in the Brazilian SUS from 2014 to 2024", transform=fig.transFigure, ha='left', fontsize=9, alpha=.7)
 
 plt.tight_layout()
@@ -296,7 +284,7 @@ plt.show()
 ::: {layout="[20, 80]"}
 
 - North & Northeast concentrate most of the states with rates **above 9%**, pointing to challenges in primary care access and effectiveness.
-- **Roraima** (13.5%), **Maranhão** (12.1%), and **Pará** (10.4%) show the greatest burden of ICSAP hospitalizations.
+- **Roraima** (15.2%), **Maranhão** (13.5%), and **Pará** (11.4%) show the greatest burden of ICSAP hospitalizations.
 - Despite higher absolute numbers, Southeast & South presents comparatively lower rates.
 
 ```{python}
@@ -341,10 +329,10 @@ gdf["centroid"] = gdf.geometry.centroid
 
 # Prepare data for the bar plot
 # Define bins (categories) for hospitalization rates
-bins = [5, 7, 8, 9, 11, 15]
-labels = ["5–7%", "7–8%", "8–9%", "9–11%", ">11%"]
+bins = [5, 8, 9, 10, 13, 16]
+labels = ["5–8%", "8–9%", "9-10%", "10–13%", ">13%"]
 
-# Step 2: Copy a simplified dataset
+# Copy a simplified dataset
 atlas = gdf[["rate_icsap_hosp", "total_icsap_hosp"]].copy()
 
 # Cut data based on the bins
@@ -420,7 +408,7 @@ mini_ax.axvline(x=0, color="black")
 mini_ax.invert_yaxis()  # Flip y-axis 
 
 # Define which groups get labels outside the bars
-group_label_out = [">11%", "8–9%", "7–8%"]
+group_label_out = [">13%", "8–9%", "10–13%"]
 
 # Add percentage labels on bars
 for p, group in zip(mini_ax.patches, pop_rate["group_rate"]):
@@ -460,10 +448,9 @@ for p, group in zip(mini_ax.patches, pop_rate["group_rate"]):
 
 
 # Add fig titles
-fig.text(x=0.5, y=0.88, s="Regional Inequalities in Avoidable Hospitalizations in Brazil, 2024", transform=fig.transFigure, ha="center", size=12, weight="bold", alpha=.6)
-fig.text(x=0.5, y=0.86, s="State-level hospitalization rates", transform=fig.transFigure, ha="center", size=9, alpha=.7)
+fig.text(x=0.5, y=0.88, s="Regional Inequalities in Avoidable Hospitalizations in Brazil, 2024", transform=fig.transFigure, ha="center", size=12, weight="bold", alpha=.9)
 
-fig.text(x=0.17, y=0.44, s="Share of hospitalizations by rate", size=10, alpha=.7)
+fig.text(x=0.17, y=0.44, s="Share of hospitalizations by rate", size=10, alpha=.8)
 
 plt.show()
 ```
@@ -556,8 +543,8 @@ for s in ["top", "bottom", "left", "right"]:
     ax.spines[s].set_visible(False)
 
 # Title and subtitle
-ax.text(x=0.05, y=0.96, s="How the Leading Categories of ICSAP's Have Changed in Brazil", transform=fig.transFigure, ha="left", size=10, weight="bold", alpha=.6)
-ax.text(x=0.05, y=0.93, s="From 2014 to 2024, some conditions rose while others declined", transform=fig.transFigure, ha="left", size=8, alpha=.7)
+ax.text(x=0.05, y=0.96, s="How the Leading Categories of ICSAP's Have Changed in Brazil", transform=fig.transFigure, ha="left", size=10, weight="bold", alpha=.9)
+ax.text(x=0.05, y=0.93, s="From 2014 to 2024, some conditions rose while others declined", transform=fig.transFigure, ha="left", size=8, alpha=.8)
 
 plt.tight_layout()
 plt.show()
@@ -640,8 +627,8 @@ ax.tick_params(axis="y", labelsize=10)
 ax.tick_params(axis="x", labelsize=9)
 
 # Tiltle and subtiltle
-ax.text(x=0.05, y=0.96, s="Hospitalization Costs of the 10 Leading ICSAP's (Brazil, 2024)", transform=fig.transFigure, ha="left", size=11, weight="bold", alpha=.6)
-ax.text(x=0.05, y=0.93, s="Cerebrovascular diseases topped the ranking of hospitalization costs.", transform=fig.transFigure, ha="left", size=8, alpha=.7)
+ax.text(x=0.05, y=0.96, s="Hospitalization Costs of the 10 Leading ICSAP's (Brazil, 2024)", transform=fig.transFigure, ha="left", size=11, weight="bold", alpha=.9)
+ax.text(x=0.05, y=0.93, s="Cerebrovascular diseases topped the ranking of hospitalization costs.", transform=fig.transFigure, ha="left", size=8, alpha=.8)
 
 plt.tight_layout()
 plt.show()
