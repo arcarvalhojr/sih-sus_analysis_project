@@ -1,0 +1,1336 @@
+---
+title: "Predicting the risk of death"
+author: Alexsander R. Carvalho Junior
+date: today
+execute: 
+  warning: false
+format:
+  html:
+    embed-resources: true
+    grid: 
+      body-width: 1000px 
+toc: true
+---
+
+# Objective
+
+The objective of this project is to develop a machine learning model to estimate the probability of in-hospital mortality at the time of admission for hospitalizations due to Primary Care Sensitive Conditions (PCSCs / ICSAPs) in Brazil.
+
+The model aims to support early risk classification by identifying patients with a higher probability of death based solely on information available at admission.
+
+# Methodology
+
+The methodological approach follows the SEMMA framework (Sample, Explore, Modify, Model, and Assess).
+
+The analytical base table was created with hospital admission data from 2022 to 2024. In the Sample phase the dataset will be splited into training, test, and an ou-of-time (oot) validation set. During Explore, bivariate analyses will be conducted to evaluate the relationship between each predictor and the outcome. In the Modify phase, categorical variables were encoded using a combination of encoding tools from `feature-engine` package. In the Model step, different machine learning algorithms based on boosting and bagging strategies will be compared, evaluated using weighted F1-score and ROC-AUC. Finally, in the Assess phase, model performance will be evaluated on the OOT set. We are going to use SHAP values to interpret the model’s predictions, allowing both global understanding of feature importance and local explanation of individual risk scores. 
+
+# Getting satrted
+
+First, we import some modules that will be used.
+
+```{python}
+from pathlib import Path
+import duckdb
+import pandas as pd
+import numpy as np
+import re
+import time
+import joblib
+
+import matplotlib.pyplot as plt
+import seaborn as sns
+from pypalettes import load_cmap
+
+from feature_engine.encoding import MeanEncoder
+from feature_engine.encoding import OneHotEncoder
+from feature_engine.selection import DropFeatures
+
+from sklearn.model_selection import train_test_split
+from sklearn.base import BaseEstimator, TransformerMixin
+from sklearn.pipeline import Pipeline
+from sklearn.ensemble import RandomForestClassifier
+from sklearn.model_selection import RandomizedSearchCV
+
+from sklearn.metrics import f1_score, roc_auc_score, roc_curve
+from sklearn.metrics import ConfusionMatrixDisplay
+
+from imblearn.ensemble import BalancedBaggingClassifier
+from imblearn.ensemble import BalancedRandomForestClassifier
+
+import xgboost as xgb
+import lightgbm as lgb
+
+import shap
+```
+
+
+The analytical base table was created and stored as a .parquet file. We can use `duckdb` to read and load the data.
+
+```{python}
+# define base dir and data directories
+base_dir = Path.cwd().parent.parent
+data_file = base_dir / "data" / "tables_gold" / "sih_sus_abt.parquet"
+```
+
+```{python}
+# count the number of records in the dataset
+count = duckdb.sql(f"""
+SELECT COUNT(*) FROM read_parquet('{data_file}')
+""").fetchone()[0]
+
+print(f"The dataset has {count} records.")
+```
+
+# SEMMA
+## Sample
+
+We start by spliting the data into three parts. One part corresponds to the out-of-time (OOT) set, containing data from the second semester of 2024, which will be used to validate the final model. The remaining two parts (2022 and 2023) are used for model training and testing.
+
+Here, we define the OOT table and the dataset that will be further split into training and test sets.
+
+```{python}
+# query the out of time data set
+oot = duckdb.sql(f"""
+SELECT * FROM read_parquet('{data_file}')
+WHERE year = 2024 AND month >= 7
+""").df()
+
+# query the data for train and test
+df = duckdb.sql(f"""
+SELECT * FROM read_parquet('{data_file}')
+WHERE (year < 2024)
+  OR (year = 2024 AND month <=6)
+""").df()
+```
+
+```{python}
+df.head()
+```
+
+Temporal features like `year`and `month` won't be used. The target variable for the classification task is `death_flag` (denoted as y), while the remaining variables are used as predictive features (X).
+
+```{python}
+# define explanatory features and the target
+features = df.columns[3:-1]
+target = "death_flag"
+
+X, y = df[features], df[target]
+```
+
+Before random split the data, we can check the mean values of the target classes.
+
+```{python}
+print(f"{100*(y.value_counts(normalize=True)[0]):.1f}% of the target values are from the class 0")
+print(f"{100*(y.value_counts(normalize=True)[1]):.1f}% of the target values are from the class 1")
+```
+
+The target variable is clearly imbalanced! However we continue with a random train/test split with an 80:20 ratio.
+
+```{python}
+# random split the data into train (80%) and test (20%) set
+# stratify by the target 
+X_train, X_test, y_train, y_test = train_test_split(X, y,
+                                                    random_state=42,
+                                                    test_size=0.2,
+                                                    stratify=y)
+```
+
+```{python}
+print(f"Training set has {y_train.shape[0]} obs. and a target variable rate of {100*y_train.mean():.2f}%")
+print(f"Test set has {y_test.shape[0]} obs. and a target variable rate of {100*y_test.mean():.2f}%")
+```
+
+```{python}
+# displaying sizes of train/test features and labels
+print("Training features shape:", X_train.shape)
+print("Training labels shape:", y_train.shape)
+print("Testing features shape:", X_test.shape)
+print("Testing features shape:", y_test.shape)
+```
+
+## Explore
+
+To explore the data, we merge the training features and target temporarily.
+
+```{python}
+# merge the X and y train only for exploratory analysis
+df_train = X_train.copy()
+df_train[target] = y_train.copy()
+```
+
+First, check for missing values (NA).
+
+```{python}
+df_train.isna().sum()
+```
+
+Nice, no NA values are found in the dataset.
+
+### Bivariate analysis
+
+```{python}
+# define theme and palette used for plots
+cmap = load_cmap("Color_Blind")
+sns.set_theme(style="white", palette=cmap.colors)
+```
+
+The only nummeric features in the data set are `age` and `total_hosp_days`. We can explore their descriptive statistic to better understand their distributions.
+
+```{python}
+age_summary = (
+  df_train.groupby(by="death_flag")["age"]
+          .agg(
+            mean = "mean",
+            median = "median",
+            std = "std"
+          )
+          .reset_index()
+)
+age_summary
+```
+
+There are some differences in age distribution between patients who survived (0) and those who died (1) during hospitalization. The mean age is approximately 50 years for the ones how lived, with a median of 57, and a relatively high standard deviation, indicating wide variability in ages. In contrast, patients who died have a significantly higher mean age of about 71 years, with a median of 74, and a lower standard deviation, suggesting that deaths are more concentrated in older age groups.
+
+```{python}
+#| label: fig-age-summary
+#| fig-cap: "Impact of age on mortality risk"
+#| fig-subcap: 
+#|   - "Distribution os Deaths by Age at Hospitalization"
+#|   - "Risk of Death by Age at Hospitalization"
+#| layout-ncol: 2
+
+# boxplot
+fig, ax = plt.subplots()
+
+sns.boxplot(
+  data=df_train,
+  x="death_flag", y="age",
+  hue="death_flag", legend=False
+)
+ax.set_ylabel("Age at hospitalization")
+ax.set_xlabel("")
+plt.tight_layout()
+
+# regplot
+# get a subset of the data
+n = df_train.sample(frac=0.005)
+
+fig, ax = plt.subplots()
+
+sns.regplot(
+    x='age',
+    y='death_flag',
+    data=n,
+    logistic=True,
+    scatter=False
+)
+ax.set_xlabel("Age at hospitalization")
+ax.set_ylabel("Risk of death")
+plt.tight_layout()
+```
+
+Age appears to be a good predictor and may help distinguish between high- and low-risk patients. However, the relationship between age and mortality risk is not linear.
+
+Now we can look for the days of hospitalization.
+
+```{python}
+hosp_days_summary = (
+  df_train.groupby(by="death_flag")["total_hosp_days"]
+          .agg(
+            mean = "mean",
+            median = "median",
+            std = "std"
+          )
+          .reset_index()
+)
+hosp_days_summary
+```
+
+```{python}
+#| label: fig-hosp_days-summary
+#| fig-cap: "Impact of the total hosp. days on mortality risk"
+#| fig-subcap: 
+#|   - "Distribution os Deaths by Total Days of Hospitalization"
+#|   - "Risk of Death by Days of Hospitalization"
+#| layout-ncol: 2
+
+# boxplot
+fig, ax = plt.subplots()
+
+sns.boxplot(
+  data=df_train,
+  x="death_flag", y="total_hosp_days",
+  hue="death_flag", legend=False
+)
+ax.set_ylabel("Days of Hospitalization")
+ax.set_xlabel("")
+plt.tight_layout()
+
+# regplot
+fig, ax = plt.subplots()
+
+sns.regplot(
+    x='total_hosp_days',
+    y='death_flag',
+    data=n,
+    logistic=True,
+    scatter=False
+)
+ax.set_xlabel("Days of Hospitalization")
+ax.set_ylabel("Risk of death")
+plt.tight_layout()
+```
+
+There is substantial variability in the length of hospital stay among both survivors and non-survivors. The presence of outliers and the non-linear pattern suggest that length of stay colud be associate with different complex clinical processes rather than acting as a simple risk factor. For this reason, we can try to adress more value for this feature by aggregating it with other features.
+
+Let's have a look into the categorical features.
+
+Given the large number of categorical variables, we can create helper functions to automate repetitive exploratory tasks.
+
+```{python}
+# define a function for summarise categoric features
+def summary(df, by, sort):
+  return(
+    df.groupby(by)["death_flag"]
+      .agg(
+          death_rate = "mean",
+          total_deaths = "sum",
+          total_obs = "count",
+          )
+      .sort_values(by=sort, ascending=False)
+      .reset_index()
+  )
+```
+
+```{python}
+# function for plot categorical features
+def plot_count_rate(df, x, y, order):
+  order = order[x]
+
+  fig, ax = plt.subplots()
+
+  sns.barplot(
+    data=df,
+    x=x, y=y, hue=x,
+    order=order, hue_order=order
+  )
+  ax.spines[["right", "top", "left"]].set_visible(False)
+  ax.yaxis.set_visible(False)
+  ax.set_xlabel("")
+
+  return ax
+```
+
+Among the categorical features, `big_region_name`and `disease_category` were already binned from their original representations to reduce cardinality.
+
+```{python}
+# summary of total and rate of death by region
+region_summary = summary(df_train, by="big_region_name", sort="total_deaths")
+
+# summary of total and rate of death by gender
+gender_summary = summary(df_train, by="gender", sort="total_deaths")
+
+# summary of total and rate of death by hosp. complexity
+complexity_summary = summary(df_train, by="complexity", sort="total_deaths")
+```
+
+```{python}
+#| label: fig-personal-vars-summary
+#| fig-cap: "Impact of age and sex on mortality"
+#| fig-subcap: 
+#|   - "Total of Deaths by Brazilian Regions"
+#|   - "Total of Deaths by Sex"
+#|   - "Rate of Death by Brazilian Regions"
+#|   - "Rate of Deaths by Sex"
+#| layout-ncol: 2
+#| layout-nrow: 2
+
+# plot for the number of deaths
+# by region
+ax = plot_count_rate(region_summary, x="big_region_name", y="total_deaths", order=region_summary)
+for container in ax.containers:
+    ax.bar_label(container, fontsize=9, color='black', fontweight='bold')
+
+# by gender
+ax = plot_count_rate(gender_summary, x="gender", y="total_deaths", order=gender_summary)
+for container in ax.containers:
+    ax.bar_label(container, fontsize=9, color='black', fontweight='bold')
+
+# plot for the rate of death
+# by region
+ax = plot_count_rate(region_summary, x="big_region_name", y="death_rate", order=region_summary)
+for container in ax.containers:
+    ax.bar_label(container, fmt=lambda x: f'{x * 100:.1f}%', fontsize=9, color='black', fontweight='bold')
+
+# by gender
+ax = plot_count_rate(gender_summary, x="gender", y="death_rate", order=gender_summary)
+for container in ax.containers:
+    ax.bar_label(container, fmt=lambda x: f'{x * 100:.1f}%', fontsize=9, color='black', fontweight='bold')
+```
+
+Mortality rates show variation across the major regions of the country. These differences suggest that regional factors may influence in-hospital mortality, potentially reflecting disparities in population health profiles, healthcare access, or clinical resource availability.
+
+Gender, on the other hand, shows only minimal differences in mortality between males and females and is therefore expected to contribute little on its own.
+
+```{python}
+#| label: fig-complexity-summary
+#| fig-cap: "Impact of hospitalization complexity on mortality risk"
+#| fig-subcap: 
+#|   - "Total of Deaths by the Type of Complexity"
+#|   - "Rate of Death by the Type of Complexity"
+#| layout-ncol: 2
+
+# plot for the number of deaths and rate of hosp complexity
+# total
+ax = plot_count_rate(complexity_summary, x="complexity", y="total_deaths", order=complexity_summary)
+for container in ax.containers:
+    ax.bar_label(container, fontsize=9, color='black', fontweight='bold')
+
+# rate
+ax = plot_count_rate(complexity_summary, x="complexity", y="death_rate", order=complexity_summary)
+for container in ax.containers:
+    ax.bar_label(container, fmt=lambda x: f'{x * 100:.1f}%', fontsize=9, color='black', fontweight='bold')
+```
+
+Care complexity shows a clear difference in mortality across categories, suggesting it provides a coarse but relevant signal of patient acuity.
+
+Next, we explore `disease_category`, `bed_speciality` and `procedure`.
+
+```{python}
+# summary of total and rate of death by disease category
+disease_summary = summary(df_train, by="disease_category", sort="death_rate")
+disease_summary
+```
+
+Disease category is one of the most informative features, with very large mortality differences between conditions like heart failure, cerebrovascular disease, nutritional deficiencies, and lower-risk infectious or chronic conditions. Together, these variables encode direct information about the clinical scenario and should contribute to the model’s ability to separate outcomes.
+
+```{python}
+# summary of total and rate of death by bed speciality
+speciality_summary = summary(df_train, by="bed_speciality", sort="death_rate")
+speciality_summary
+```
+
+Bed specialty exhibits substantial heterogeneity! Neurosurgery beds have very high mortality, while some specialties report none. Also, there are categories with a large number of records and others wir few.
+
+```{python}
+# summary of total and rate of death by procedure
+procedures_summary = summary(df_train, by="procedure", sort="death_rate")
+procedures_summary
+```
+
+Many procedures show mortality rates of 100% or 0% simply because they occur only once or twice, which can mislead model training. To handle this, rare and true zero categories should be adressed. Once this is done, procedure type can be a good indicator of severity and clinical complexity, and is likely to be one of the top contributors in the model.
+
+Some bed speciality and procedures categories have zero cases of death and rare number of observations (<= 100). We therefore aggregate these categories to capture true zero death cases and reduce noise from rare events. By doing this we can reduce the cardinality of these features, specialy for `procedure`.
+
+For example, procedures categories with fewer than or equal to 100 observations are considered rare cases, while those with fewer than or equal to 1000 observations are treated as few cases.
+
+```{python}
+# filter for zero risk procedures
+procedures_zero_risk = procedures_summary[
+  (procedures_summary["total_deaths"] == 0) & 
+  (procedures_summary["total_obs"] > 100)]["procedure"].tolist()
+
+# filter for procedures with few cases
+procedures_few_cases = procedures_summary[
+  (procedures_summary["total_deaths"] > 0) & 
+  (procedures_summary["total_obs"] > 100) & 
+  (procedures_summary["total_obs"] <= 1000)]["procedure"].tolist()
+
+# filter for procedures with rare cases
+procedures_rare_cases = procedures_summary[
+  (procedures_summary["total_obs"] <= 100)]["procedure"].tolist()
+```
+
+```{python}
+# apply the list of filters for procedures
+df_train["procedure"] = np.where(
+  df_train["procedure"].isin(procedures_zero_risk),
+  "zero risk", df_train["procedure"]
+)
+df_train["procedure"] = np.where(
+  df_train["procedure"].isin(procedures_few_cases),
+  "few cases", df_train["procedure"]
+)
+df_train["procedure"] = np.where(
+  df_train["procedure"].isin(procedures_rare_cases),
+  "rare cases", df_train["procedure"]
+)
+```
+
+```{python}
+procedure_transformed = summary(
+  df_train, by="procedure", sort="death_rate")
+
+procedure_transformed
+```
+
+As a result, the number of procedure categories is reduced from 1,006 to 55, causing more reliable mortality estimates.
+
+## Modify
+
+At this stage, we create two custom transformers to apply these aggregations consistently across the training and test sets.
+
+```{python}
+# custom transformer to transform bed speciality feature
+# create the summary, define the filters and apply them to the dataset
+class SpecialityGrouper(BaseEstimator, TransformerMixin):
+  def __init__(self, target_col="death_flag"):
+    self.target_col = target_col
+    self.zero_risk_ = []
+    self.few_cases_ = []
+    self.rare_cases_ = []
+
+  def fit(self, X, y):
+    df_temp = X.copy()
+    df_temp[self.target_col] = y
+    
+    # create the summary
+    summary = df_temp.groupby("bed_speciality")[self.target_col].agg([
+      'sum', 'count'])
+    summary.columns = ['total_deaths', 'total_obs']
+
+    # define the filters
+    self.zero_risk_ = summary[
+      (summary["total_deaths"] == 0) & (summary["total_obs"] > 100)
+    ].index.tolist()
+
+    self.few_cases_ = summary[
+      (summary["total_deaths"] > 0) & (summary["total_obs"] > 100) & 
+      (summary["total_obs"] <= 3000)
+    ].index.tolist()
+    
+    self.rare_cases_ = summary[
+      (summary["total_obs"] <= 100)
+    ].index.tolist()
+
+    return self
+
+  def transform(self, X):
+    X = X.copy()
+
+    # define conditions to be applied
+    conditions = [
+      X["bed_speciality"].isin(self.zero_risk_),
+      X["bed_speciality"].isin(self.few_cases_),
+      X["bed_speciality"].isin(self.rare_cases_)
+    ]
+    results = ["zero risk", "few cases", "rare cases"]
+
+    # apply the conditions
+    X["bed_speciality"] = np.select(
+      conditions, results, default=X["bed_speciality"] 
+    )
+    return X
+```
+
+```{python}
+# custom transformer to transform procedure feature
+# same logic as before
+class ProcedureGrouper(BaseEstimator, TransformerMixin):
+  def __init__(self, target_col="death_flag"):
+    self.target_col = target_col
+    self.zero_risk_ = []
+    self.few_cases_ = []
+    self.rare_cases_ = []
+    
+  def fit(self, X, y):
+    df_temp = X.copy()
+    df_temp[self.target_col] = y
+    
+    summary = df_temp.groupby("procedure")[self.target_col].agg(['sum', 'count'])
+    summary.columns = ['total_deaths', 'total_obs']
+    
+    self.zero_risk_ = summary[
+        (summary["total_deaths"] == 0) & (summary["total_obs"] > 100)
+    ].index.tolist()
+    
+    self.few_cases_ = summary[
+        (summary["total_deaths"] > 0) & (summary["total_obs"] > 100) &
+        (summary["total_obs"] <= 1000)
+    ].index.tolist()
+    
+    self.rare_cases_ = summary[
+      (summary["total_obs"] <= 100)
+    ].index.tolist()
+
+    return self
+
+  def transform(self, X):
+    X = X.copy()
+
+    conditions = [
+      X["procedure"].isin(self.zero_risk_),
+      X["procedure"].isin(self.few_cases_),
+      X["procedure"].isin(self.rare_cases_)
+    ]
+    results = ["zero risk", "few cases", "rare cases"]
+
+    X["procedure"] = np.select(
+      conditions, results, default=X["procedure"] 
+    )
+    return X
+```
+
+This next transformer adds a historical, group-level estimate of typical hospital stay duration, helping the model capture latent severity and care complexity patterns without using outcome information directly (data leakage).
+
+```{python}
+# custom transformer to calculate the median days of hosptalization by age and some other feature
+class MeanDaysByGrouper(BaseEstimator, TransformerMixin):
+  def __init__(self, days_column, grouping_cols, feature_name):
+    self.days_column = days_column
+    self.grouping_cols = grouping_cols
+    self.feature_name = feature_name
+    self.mapping_ = None
+
+  def fit(self, X, y):
+    X_fit = X.copy()
+    X_fit["target"] = y.values
+    # define the filter by who survived
+    survivors = X_fit[X_fit["target"] == 0]
+    # set the map to get the mean only by the survivors
+    self.mapping_ = (survivors
+        .groupby(self.grouping_cols)[self.days_column]
+        .mean()
+    )
+    return self
+
+  def transform(self, X):
+    X_tr = X.copy()
+    
+    X_tr[self.feature_name] = (
+      X_tr
+      .set_index(self.grouping_cols)
+      .index
+      .map(self.mapping_)
+    )
+    return X_tr
+```
+
+
+We then build a preprocessing pipeline that automates these transformations along with categorical encoding. In the final step, we drop the `total_hosp_days` feature, as it introduces future information and would lead to data leakage.
+
+```{python}
+# columns to one-hot-encoding (no more than 10 unique categories)
+cols_to_ohe = ["gender", "big_region_name", "complexity", "bed_speciality"]
+
+# columns to mean encoding (> 10 unique categories)
+cols_to_mec = ["procedure", "disease_category"]
+
+# define encoders
+mean_encoder = MeanEncoder(variables=cols_to_mec, missing_values="ignore")
+one_hot_encoder = OneHotEncoder(variables=cols_to_ohe, drop_last=False)
+
+# define the pipeline
+preprocess_pipeline = Pipeline([
+  ("speciality_grouper", SpecialityGrouper(target_col="death_flag")),
+  ("procedure_grouper", ProcedureGrouper(target_col="death_flag")),
+  ("mean_days_disease", MeanDaysByGrouper(
+    days_column="total_hosp_days",
+    grouping_cols=["disease_category"],
+    feature_name="mean_days_by_disease"
+  )),
+  ("mean_days_speciality", MeanDaysByGrouper(
+    days_column="total_hosp_days",
+    grouping_cols=["bed_speciality"],
+    feature_name="mean_days_by_speciality"
+  )),
+  ("mean_enco", mean_encoder),
+  ("one_hot_enc", one_hot_encoder),
+  ("drop_features", DropFeatures(features_to_drop="total_hosp_days"))
+])
+```
+
+Fit and transform the train/test set.
+
+```{python}
+# transform train/test sets
+# fit the pipeline in the train set
+X_train_full = preprocess_pipeline.fit_transform(X_train, y_train)
+
+# transform the test set
+X_test_full = preprocess_pipeline.transform(X_test)
+
+# replace special characters in features names after ohe
+rename_func = lambda x: re.sub(r'[^A-Za-z0-9_]+', '_', x)
+X_train_full.columns = X_train_full.columns.map(rename_func)
+X_test_full.columns = X_test_full.columns.map(rename_func)
+```
+
+```{python}
+X_train_full.head()
+```
+
+## Model & Assess
+
+We train and evaluate five ensemble models (Bagging and Boosting algorithms) to identify the one with the best performance, focusing primarily on ROC-AUC. Model performance is reported using ROC-AUC and weighted F1-score.
+
+```{python}
+# function for plot confusion matrix
+def plot_cm(estimator, x, y, normalize):
+
+  fig, ax = plt.subplots()
+
+  ConfusionMatrixDisplay.from_estimator(
+    estimator=estimator,
+    X=x, y=y,
+    normalize=normalize, ax=ax
+  )
+  ax.set_xlabel("Predicted")
+  ax.set_ylabel("Observed")
+
+  return ax
+```
+
+### XGBoost Classifier
+
+```{python}
+start = time.time()
+
+# calculate target ratio for XGBoost
+scale_pos_weight = np.sum(y_train == 0) / np.sum(y_train == 1)
+
+# define xgboost model
+model_xgb = xgb.XGBClassifier(
+  n_estimators=500, scale_pos_weight=scale_pos_weight, random_state=42
+)
+
+# fit XGBoost model
+model_xgb.fit(X_train_full, y_train)
+print(f"Time taken: {time.time() - start:.1f}s")
+```
+
+```{python}
+# print training results
+print(f"XGBoost train weighted F1-score: {f1_score(y_train, model_xgb.predict(X_train_full), average="weighted"):.3f}")
+print(f"XGBoost train ROC-AUC score: {roc_auc_score(y_train, model_xgb.predict_proba(X_train_full)[:,1]):.3f}")
+```
+
+```{python}
+start = time.time()
+
+# predict
+xgb_test_f1 = f1_score(y_test, model_xgb.predict(X_test_full), average="weighted")
+
+# get proba and auc
+xgb_test_proba = model_xgb.predict_proba(X_test_full)[:, 1]
+xgb_test_auc = roc_auc_score(y_test, xgb_test_proba)
+print(f"Time taken: {time.time() - start:.1f}s")
+```
+
+```{python}
+# print results 
+print(f"XGBoost test weighted F1-score: {xgb_test_f1:.3f}")
+print(f"XGBoost test ROC-AUC score: {xgb_test_auc:.3f}")
+```
+
+```{python}
+#| label: fig-cm-xgboost
+#| fig-cap: "Confusion Matrix XGBoost model"
+#| fig-subcap: 
+#|   - "Absolute counts"
+#|   - "True Class Success Rate"
+#| layout-ncol: 2
+
+xgb_cm =  plot_cm(model_xgb, X_test_full, y_test, normalize=None)
+xgb_cm_norm =  plot_cm(model_xgb, X_test_full, y_test, normalize='true')
+
+xgb_cm
+xgb_cm_norm
+```
+
+XGBoost showed good performance with a weighted F1-score of approximately 0.72 and a ROC-AUC of 0.788 on the test set. While the training ROC-AUC reached 0.801, the slight decrease in the test set suggests minor overfitting.
+
+The model correctly identifies a large number of survivors (293,823 True Negatives) but generates a substantial number of False Positives (183,165). The number of False Negatives (6,502) is relatively low compared to the True Positives (32,485). This implies a recall of approximately 83.3%, showing that the model is effective at detecting most high-risk patients, missing only a small fraction of actual deaths.
+
+### LightGBM Classifier
+
+```{python}
+start = time.time()
+
+# define LightGBM model
+model_lgb = lgb.LGBMClassifier(
+  n_estimators=500, is_unbalance=True, random_seed=42,
+  verbose=0
+)
+
+# fit LightGBM model
+model_lgb.fit(X_train_full, y_train)
+print(f"Time taken: {time.time() - start:.1f}s")
+```
+
+```{python}
+# print training results
+print(f"LightGBM train weighted F1 score: {f1_score(y_train, model_lgb.predict(X_train_full), average="weighted"):.3f}")
+print(f"LightGBM train ROC-AUC score: {roc_auc_score(y_train, model_lgb.predict_proba(X_train_full)[:,1]):.3f}")
+```
+
+```{python}
+start_time = time.time()
+
+# predict
+lgb_test_f1 = f1_score(y_test, model_lgb.predict(X_test_full), average='weighted')
+
+# get proba and auc
+lgb_test_proba = model_lgb.predict_proba(X_test_full)[:, 1]
+lgb_test_auc = roc_auc_score(y_test, lgb_test_proba)
+print(f"Time taken: {time.time() - start_time:.1f}s")
+```
+
+```{python}
+# print result
+print(f"LightGBM test weighted F1-score: {lgb_test_f1:.3f}")
+print(f"LightGBM test ROC-AUC score: {lgb_test_auc:.3f}")
+```
+
+```{python}
+#| label: fig-cm-lightgbm
+#| fig-cap: "Confusion Matrix LightGBM model"
+#| fig-subcap: 
+#|   - "Absolute counts"
+#|   - "True Class Success Rate"
+#| layout-ncol: 2
+
+lgb_cm =  plot_cm(model_lgb, X_test_full, y_test, normalize=None)
+lgb_cm_norm =  plot_cm(model_lgb, X_test_full, y_test, normalize='true')
+
+lgb_cm
+lgb_cm_norm
+```
+
+LightGBM delivered the best overall results, slightly outperforming XGBoost with a test ROC-AUC of 0.790. Notably, LightGBM showed higher stability between training (0.796) and testing. Although it increased the number of FP, the model detected 32,649 True Positives — identifying 164 more death cases than XGBoost.
+
+### Random Forest Classifier
+
+```{python}
+start = time.time()
+
+# define random forest model
+model_rfc = RandomForestClassifier(
+  n_estimators=200, max_depth=6, class_weight="balanced", random_state=42
+)
+
+# fit the model
+model_rfc.fit(X_train_full, y_train)
+print(f"Time taken: {(time.time() - start)/60:.1f}m")
+```
+
+```{python}
+# print training results
+print(f"Random Forest train weighted F1-score: {f1_score(y_train, model_rfc.predict(X_train_full), average="weighted"):.3f}")
+print(f"Random Forest train ROC-AUC score: {roc_auc_score(y_train, model_rfc.predict_proba(X_train_full)[:,1]):.3f}")
+```
+
+```{python}
+start_time = time.time()
+
+# predict 
+rfc_test_f1 = f1_score(y_test, model_rfc.predict(X_test_full), average='weighted')
+
+# get proba and auc
+rfc_test_proba = model_rfc.predict_proba(X_test_full)[:, 1]
+rfc_test_auc = roc_auc_score(y_test, rfc_test_proba)
+print(f"Time taken: {time.time() - start_time:.1f}s")
+```
+
+```{python}
+# print result
+print(f"Random Forest test weighted F1-score: {rfc_test_f1:.3f}")
+print(f"Random Forest test ROC-AUC score: {rfc_test_auc:.3f}")
+```
+
+```{python}
+#| label: fig-cm-randomf
+#| fig-cap: "Confusion Matrix Random Forest model"
+#| fig-subcap: 
+#|   - "Absolute counts"
+#|   - "True Class Success Rate"
+#| layout-ncol: 2
+
+rfc_cm =  plot_cm(model_rfc, X_test_full, y_test, normalize=None)
+rfc_cm_norm =  plot_cm(model_rfc, X_test_full, y_test, normalize='true')
+
+rfc_cm
+rfc_cm_norm
+```
+
+The Random Forest model achieved a test ROC-AUC of 0.777, with basicaly no gap between training and testing scores (0.778 vs 0.777). While highly consistent, its lower recall (80.2%) and higher number of False Negatives (7,709) suggest that its complexity prevents it from capturing the intricate patterns of mortality risk like the boosting algorithms. RF model had over 1000 TP less than LightGBM.
+
+### Balanced Bagging Classifier
+
+```{python}
+start = time.time()
+
+# define the model
+model_bbc = BalancedBaggingClassifier(
+  n_estimators=100, sampling_strategy="auto", random_state=42
+)
+
+# fit model
+model_bbc.fit(X_train_full, y_train)
+print(f"Time taken: {(time.time() - start)/60:.1f}m")
+```
+
+```{python}
+# print training results
+print(f"BalancedBC train weighted F1-score: {f1_score(y_train, model_bbc.predict(X_train_full), average="weighted"):.3f}")
+print(f"BalancedBC train ROC-AUC score: {roc_auc_score(y_train, model_bbc.predict_proba(X_train_full)[:,1]):.3f}")
+```
+
+```{python}
+start = time.time()
+
+# predict
+bbc_test_f1 = f1_score(y_test, model_bbc.predict(X_test_full), average="weighted")
+
+# get proba and auc
+bbc_test_proba = model_bbc.predict_proba(X_test_full)[:, 1]
+bbc_test_auc = roc_auc_score(y_test, bbc_test_proba)
+print(f"Time taken: {(time.time() - start)/60:.1f}m")
+```
+
+```{python}
+# print results
+print(f"BalancedBC test weighted F1-score: {bbc_test_f1:.3f}")
+print(f"BalancedBC test ROC-AUC score: {bbc_test_auc:.3f}")
+```
+
+```{python}
+#| label: fig-cm-balancedbc
+#| fig-cap: "Confusion Matrix BalancedBC model"
+#| fig-subcap: 
+#|   - "Absolute counts"
+#|   - "True Class Success Rate"
+#| layout-ncol: 2
+
+bbc_cm =  plot_cm(model_bbc, X_test_full, y_test, normalize=None)
+bbc_cm_norm =  plot_cm(model_bbc, X_test_full, y_test, normalize='true')
+
+bbc_cm
+bbc_cm_norm
+```
+
+BalancedBaggingClassifier (BalancedBC) achieved a slightly higher ROC-AUC on the training set but showed a significant drop in the test set. While it produced fewer FP than the boosting models, its inability to generalize led it to miss over 1000 additional real death cases compared to LightGBM, highlighting the limitations of internal undersampling for this dataset.
+
+### Balanced Random Forest
+
+```{python}
+start = time.time()
+
+# define the model
+model_brf = BalancedRandomForestClassifier(
+  n_estimators=200, sampling_strategy="auto", random_state=42
+)
+
+# fit model
+model_brf.fit(X_train_full, y_train)
+print(f"Time taken: {(time.time() - start)/60:.1f}m")
+```
+
+```{python}
+# print training results
+print(f"BalancedRF train weighted F1-score: {f1_score(y_train, model_brf.predict(X_train_full), average="weighted"):.3f}")
+print(f"BalancedRF train ROC-AUC score: {roc_auc_score(y_train, model_brf.predict_proba(X_train_full)[:,1]):.3f}")
+```
+
+```{python}
+start = time.time()
+
+# predict
+brf_test_f1 = f1_score(y_test, model_brf.predict(X_test_full), average="weighted")
+
+# get proba and auc
+brf_test_proba = model_brf.predict_proba(X_test_full)[:, 1]
+brf_test_auc = roc_auc_score(y_test, brf_test_proba)
+print(f"Time taken: {(time.time() - start)/60:.1f}m")
+```
+
+```{python}
+# print results
+print(f"BalancedRF test weighted F1-score: {brf_test_f1:.3f}")
+print(f"BalancedRF test ROC-AUC score: {brf_test_auc:.3f}")
+```
+
+```{python}
+#| label: fig-cm-balancedrf
+#| fig-cap: "Confusion Matrix BalancedRF model"
+#| fig-subcap: 
+#|   - "Absolute counts"
+#|   - "True Class Success Rate"
+#| layout-ncol: 2
+
+brf_cm =  plot_cm(model_brf, X_test_full, y_test, normalize=None)
+brf_cm_norm =  plot_cm(model_brf, X_test_full, y_test, normalize='true')
+
+brf_cm
+brf_cm_norm
+```
+
+Both BalancedBC and BalancedRandomForest (BalancedRF) suffered from "overfitting", with training ROC-AUC values of 0.81 dropping to ~0.77 on the test set. While the BalancedRF identified a high number of real death cases (32,439), its overall ability to separate classes was inferior to the boosting models, resulting in a higher number of FP (~7000) than LightGBM.
+
+Despite no big difference in the ROC-AUC score over the tested models, boosting algorithms outperformed the Bagging algorithms being LightGBM model the best one.
+
+```{python}
+# dict with all tested models proba
+models = {
+  "XGBoost": xgb_test_proba,
+  "LightGBM": lgb_test_proba,
+  "Random Forest": rfc_test_proba,
+  "BalancedBC": bbc_test_proba,
+  "BalancedRF": brf_test_proba
+}
+```
+
+```{python}
+#| label: fig-roc-curve-models
+#| fig-cap: "Roc curve of all avaliated models"
+
+# plot roc curve 
+plt.figure(figsize=(8, 6))
+
+for name, proba in models.items():
+  fpr, tpr, _ = roc_curve(y_test, proba)
+  auc = roc_auc_score(y_test, proba)
+  plt.plot(fpr, tpr, label=f"{name} (AUC: {100*auc:.2f}%)")
+
+# linha aleatória
+plt.plot([0, 1], [0, 1], linestyle="--", color="black", label="Chance (AUC: 50%)")
+
+plt.xlabel("False Positive Rate")
+plt.ylabel("True Positive Rate")
+plt.title("ROC Curve – Model Comparison")
+plt.legend()
+plt.grid(True)
+
+plt.show()
+```
+
+
+Given that the objective of this project is to estimate the risk of in-hospital mortality rather than to rely on a fixed binary classification, the LightGBM model demonstrated the best probabilistic ranking (ROC-AUC: 0.79) and faster training, indicating better performance in distinguishing high-risk patients from low-risk patients.
+
+Let's look ate the feature importance oF the model.
+
+```{python}
+# get feature importance based on importance gain
+feat_importances = pd.DataFrame({
+    'feature': X_train_full.columns,
+    'importance': model_lgb.booster_.feature_importance(importance_type="gain")
+}).sort_values(by='importance', ascending=False)
+
+# calculate cumulative importance
+feat_importances["cum_importance"] = (
+    feat_importances["importance"].cumsum() /
+    feat_importances["importance"].sum()
+)
+
+feat_importances
+```
+
+
+Feature importance shows that age alone explains more than half of the model’s total gain. Also, 99% of the model gain is explained by half of the features. Since the overall number of features is already small, we proceed with the full model rather than attempting feature selection or dimensionality reduction.
+
+### Tuning
+
+At this point we can try tuning the LightGBM model for improve its ROC-AUC performance.
+
+```{python}
+#| warning: false
+
+start = time.time()
+
+# define model
+model = lgb.LGBMClassifier(is_unbalance=True, random_seed=42, verbose=-1)
+
+# define parameters
+param_grid = {
+  'n_estimators': [500, 800],
+  'learning_rate': [0.03, 0.05, 0.08],
+  'num_leaves': [15, 31, 63],
+  'max_depth': [4, 6, 8],
+  'min_child_samples': [20, 50, 100],
+  'subsample': [0.5, 0.8, 1.0],
+  'colsample_bytree': [0.5, 0.8, 1.0],
+  'reg_alpha': [0.01, 0.1, 1.0],       
+  'reg_lambda': [0.01, 0.1, 1.0]
+}
+
+# random search
+random_search = RandomizedSearchCV(
+  estimator=model,
+  param_distributions=param_grid,
+  n_iter=20,
+  cv=3,
+  scoring='roc_auc',
+  verbose=0,
+  random_state=42
+)
+
+# fit random search
+random_search.fit(X_train_full, y_train)
+print(f"Time taken: {(time.time() - start)/60:.1f}m")
+```
+
+```{python}
+print("Tuned model best score:")
+random_search.best_score_
+```
+
+```{python}
+print("Tuned model best parameters:")
+random_search.best_params_
+```
+
+```{python}
+start = time.time()
+
+# get best estimator
+tuned_model = random_search.best_estimator_
+
+# predict
+tuned_f1 = f1_score(y_test, tuned_model.predict(X_test_full), average="weighted")
+tuned_auc = roc_auc_score(y_test, tuned_model.predict_proba(X_test_full)[:, 1])
+print(f"Time taken: {time.time() - start:.1f}s")
+```
+
+```{python}
+# print results
+print(f"Tuned model weighted F1-score: {tuned_f1:.3f}")
+print(f"Tuned model ROC-AUC score: {tuned_auc:.3f}")
+```
+
+Hyperparameter optimization suggests that we have reached the inherent efficiency of the current dataset. The tuning resulted in marginal improvements in ROC-AUC, indicating that the baseline LightGBM model was already close to optimal performance given the feature set.
+
+Given the large dataset size, the minimal gains from tuning don't justify the additional complexity and computational cost.
+
+### Final model
+
+The base LightGBM model demonstrates better overall performance. Therefore, is the most appropriate choice for the primary objective of estimating the risk of in-hospital mortality.
+
+```{python}
+# define features and target set
+X_oot = oot[features]
+y_oot = oot[target]
+```
+
+```{python}
+# define the final pipeline
+final_pipeline = Pipeline([
+  ("preprocess", preprocess_pipeline),
+  ("final model", model_lgb)
+])
+```
+
+
+```{python}
+start = time.time()
+
+# predict oot
+y_pred_oot = final_pipeline.predict(X_oot)
+y_proba_oot = final_pipeline.predict_proba(X_oot)[:, 1]
+
+# get scores
+f1_ooc = f1_score(y_oot, y_pred_oot, average="weighted")
+auc_ooc = roc_auc_score(y_oot, y_proba_oot)
+print(f"Time taken: {time.time() - start:.1f}s")
+```
+
+```{python}
+# print results
+print("Model weighted F1-score:", f1_ooc)
+print("Model ROC-AUC score:", auc_ooc)
+```
+
+```{python}
+#| label: fig-roc-curve-lgb
+#| fig-cap: "Roc curves of LightGBM train/test/oot set"
+
+# get lgb train proba and auc
+lgb_train_proba = model_lgb.predict_proba(X_train_full)[:, 1]
+lgb_train_auc = roc_auc_score(y_train, lgb_train_proba)
+
+# get roc curve
+roc_train = roc_curve(y_train, lgb_train_proba)
+roc_test = roc_curve(y_test, lgb_test_proba)
+roc_oot = roc_curve(y_oot, y_proba_oot)
+
+# plot roc curve
+plt.figure(figsize=(8, 6))
+
+plt.plot(roc_train[0], roc_train[1])
+plt.plot(roc_test[0], roc_test[1])
+plt.plot(roc_oot[0], roc_oot[1])
+plt.plot([0, 1], [0, 1], linestyle="--", color="black", label="Chance")
+plt.xlabel("False Positive Rate")
+plt.ylabel("True Positive Rate")
+plt.title("LightGBM ROC Curves")
+plt.legend([
+  f"Train AUC: {100*lgb_train_auc:.1f}%",
+  f"Test AUC: {100*lgb_test_auc:.1f}%",
+  f"OOT AUC: {100*auc_ooc:.1f}%"
+  ])
+plt.grid(True)
+```
+
+
+#### SHAP values
+
+```{python}
+# get explainer and shap values
+explainer = shap.TreeExplainer(model_lgb)
+shap_values = explainer.shap_values(preprocess_pipeline.transform(X_oot))
+```
+
+
+Since categorical variables were transformed into multiple dummie features through encoding, SHAP values can be aggregated back to their original feature groups by summing the contributions of all encoded components, preserving the total contribution of each original feature.
+
+```{python}
+# make a df with the shap values
+feature_names = model_lgb.feature_name_
+shap_df = pd.DataFrame(
+  shap_values,
+  columns=feature_names
+)
+
+# map encoded features back to their original feature groups
+feature_map = {}
+
+for col in shap_df.columns:
+  if col.startswith("mean_days_by_"):
+    original = col
+  elif "_" in col:
+    original = col.split("_", 1)[0]
+  else:
+    original = col
+  feature_map.setdefault(original, []).append(col)
+
+# agg and sum SHAP values at the original feature level
+shap_agg = pd.DataFrame()
+for feature, cols in feature_map.items():
+  shap_agg[feature] = shap_df[cols].sum(axis=1)
+
+# rename features name
+shap_agg = shap_agg.rename(columns={
+  "age": "Age",
+  "procedure": "Procedure",
+  "gender": "Sex",
+  "big": "Region",
+  "complexity": "Complexity",
+  "bed": "Bed speciality",
+  "disease": "Disease category",
+  "mean_days_by_speciality": "Mean hosp. days by speciality",
+  "mean_days_by_disease": "Mean hosp. days by disease",
+})
+
+shap_agg
+```
+
+```{python}
+#| label: fig-shap_summary
+#| fig-cap: "SHAP Summary (global feature importance)"
+
+# summary of the predictions
+fig_shap_summary = plt.figure(figsize=(10, 8))
+shap.summary_plot(
+  shap_agg.values,
+  features=shap_agg,
+  feature_names=shap_agg.columns,
+  show=False
+)
+plt.tight_layout()
+```
+
+
+Features are ranked by overall importance, with `age`, `disease_category`, and `procedure` showing the largest contributions to the predictions. For all variables, higher feature values tend to be associated with positive SHAP values, increasing the predicted risk, while lower values are predominantly associated with negative SHAP values, reducing the predicted risk. Older individuals exhibit a higher predicted risk of mortality, and procedures and disease categories with higher historical mean mortality rates increase the model’s risk prediction, whereas those associated with lower historical mean mortality rates tend to reduce it.
+
+```{python}
+#| label: fig-shap-waterfall
+#| fig-cap: "SHAP Waterfall (individual feature importance)"
+
+# individual prediction
+plt.figure(figsize=(10, 8)) 
+shap.plots.waterfall(
+  shap.Explanation(
+    values=shap_agg.iloc[29].values,
+    base_values=explainer.expected_value,
+    feature_names=shap_agg.columns
+  ), show=False
+)
+plt.tight_layout()
+```
+
+
+Waterfall plot shows the contribution of individual features to the model prediction for a specific hospitalization. For this individual (29), we can see that the largest negative contributions come from `procedure` (−2.11) and `age` (−1.58), which substantially reduce the predicted risk relative to the baseline. `Disease_category` acts in the opposite direction, contributing positively (+0.83) to the prediction.
+
+
+At last, instead of using a fixed 0.5 decision threshold, which could be inadequate under class imbalance, predicted probabilities are used to stratify individuals into clinically meaningful risk categories.
+
+```{python}
+# oot transformed
+final_oot = oot.drop(columns=["death_flag", "total_hosp_days"], axis=1).copy()
+
+# create new col with the probas of death
+final_oot["risk"] = y_proba_oot
+
+# create new col with the class risk definitions
+final_oot["risk_class"] = np.select(
+  [
+    final_oot["risk"] < 0.20,
+    (final_oot["risk"] >= 0.20) & (final_oot["risk"] < 0.40),
+    (final_oot["risk"] >= 0.40) & (final_oot["risk"] < 0.60),
+    final_oot["risk"] >= 0.60
+  ],
+  [
+    "Low risk",
+    "Moderate risk",
+    "High risk",
+    "Imminent risk"
+  ],
+  default="Unknown"
+)
+```
+
+```{python}
+final_oot.head()
+```
+
+
+# Summary of results
+
+Among the evaluated models, the LightGBM classifier achieved the best overall performance and was therefore selected as the final model. Given the class imbalance and the focus on risk classification, ROC-AUC was the primary metric as it measures how well the model separates low- from high-risk patients based on predicted probabilities. 
+
+* **Overall performance**: LightGBM achieved the highest ROC-AUC score of 0.79 across the test set.
+
+* **Interpretability**: SHAP values highlited `age`, `disease_category` and `procedure` were the features with the biggest contributions to the model’s predictions.
+
+* **Efficiency**: The model showed the best computational performance (faster training time) for the largest dataset. 
+
+
+::: {.content-hidden}
+```{python}
+#| eval: false
+
+# save the final model
+joblib.dump(final_pipeline, base_dir / "ml_app" / "model.joblib")
+
+# save lgb model roc curves
+roc_data = {
+  "train":{"fpr": roc_train[0], "tpr": roc_train[1], "auc": lgb_train_auc},
+  "test":{"fpr": roc_test[0], "tpr": roc_test[1], "auc": lgb_test_auc},
+  "oot":{"fpr": roc_oot[0], "tpr": roc_oot[1], "auc": auc_ooc}
+}
+joblib.dump(roc_data, base_dir / "ml_app" / "roc_curves.joblib")
+
+# save shap summary
+fig_shap_summary.savefig(base_dir / "docs" / "shap_summary.png", dpi=300, bbox_inches='tight')
+
+# save final oot
+final_oot_sample = final_oot.sample(1000, random_state=42)
+joblib.dump(final_oot_sample, base_dir / "ml_app" / "final_data.joblib")
+
+# save X_train for features
+joblib.dump(X_train, base_dir / "ml_app" / "train_data.joblib")
+
+# save ranked procedures only
+procedure_rank = (X_train["procedure"].value_counts().reset_index())
+joblib.dump(procedure_rank, base_dir / "ml_app" / "procedure_rank.joblib")
+```
+:::
