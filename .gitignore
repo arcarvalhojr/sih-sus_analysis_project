@@ -1,5 +1,4 @@
 data/raw/sih/
 localidade.parquet
-*.csv
-
 *.duckdb
+__pycache__
