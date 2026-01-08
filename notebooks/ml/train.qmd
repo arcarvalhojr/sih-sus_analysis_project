@@ -1326,8 +1326,15 @@ fig_shap_summary.savefig(base_dir / "docs" / "shap_summary.png", dpi=300, bbox_i
 final_oot_sample = final_oot.sample(1000, random_state=42)
 joblib.dump(final_oot_sample, base_dir / "ml_app" / "final_data.joblib")
 
-# save X_train for features
-joblib.dump(X_train, base_dir / "ml_app" / "train_data.joblib")
+# save features
+features_option = {
+  "big_region_name": sorted(X_train["big_region_name"].unique().tolist()),
+  "gender": sorted(X_train["gender"].unique().tolist()),
+  "disease_category": sorted(X_train["disease_category"].unique().tolist()),
+  "bed_speciality": sorted(X_train["bed_speciality"].unique().tolist()),
+  "complexity": sorted(X_train["complexity"].unique().tolist()),
+}
+joblib.dump(features_option, base_dir / "ml_app" / "features_option.joblib")
 
 # save ranked procedures only
 procedure_rank = (X_train["procedure"].value_counts().reset_index())
