@@ -3,7 +3,7 @@
 
 This is an end-to-end Data Science project that follows the SEMMA framework to structure the machine learning workflow, from data preparation and exploratory analysis to model training, evaluation, and deployment. The project is based on the Brazilian Hospital Information System (SIH) and focuses on Ambulatory Care Sensitive Conditions (ACSC/ICSAP) within the Unified Health System (SUS).
 
-The project applies machine learning concepts such as feature selection, feature engineering, model selection, and model interpretability using SHAP. The final output is an interactive Streamlit application which runs the selected model and simulate in-hospital mortality risk at admission time, aiming to support healthcare professionals in early stratification and more informed patient management. 
+The project applies machine learning concepts such as feature selection, feature engineering, model selection, and model interpretability using SHAP. The final output is an interactive Streamlit application that runs the selected model and predict in-hospital mortality risk at admission time, aiming to support healthcare professionals in early stratification and more informed patient management. 
 
 ![Data Architecture](docs/data_architecture.png)
 
@@ -28,8 +28,8 @@ A supervised machine learning model was developed to predict in-hospital mortali
 Developed in **Quarto** notebooks using specific **Python** libraries:
 - **Pandas**: For data manipulation and exploratory analysis.
 - **Scikit-learn**: For split datasets, preprocessing pipelines, evaluation metrics (ROC-AUC & F1-score) and hyperparameter tuning.  
-- **feature-engine**: Categorical encoding techniques like One-Hot-Encoding and Mean Encoding.
-- **imbalanced-learn**: For imbalance ensemble models such Balanced RF and Balanced Bagging Classifiers.
+- **Feature-engine**: Categorical encoding techniques like One-Hot-Encoding and Mean Encoding.
+- **Imbalanced-learn**: For imbalance ensemble models such Balanced RF and Balanced Bagging Classifiers.
 - **XGBoost** & **LightGBM**: Gradient boosting models.
 - **SHAP**: Model interpretability.
 
