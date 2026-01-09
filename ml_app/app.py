@@ -175,11 +175,11 @@ with tab_summary:
 
 # more information
 # expander
-exp2 = st.expander("More information")
+exp2 = st.expander(":eyes: More information")
 exp2.markdown(
         "#### For more information of how this works:\n"
-        "* Check the machine learning code in the [HTML page](https://019b9fc6-5626-8f65-e0a1-60f288c3886a.share.connect.posit.cloud/).\n"
-        "* Check the Analytical report of the PCSCs in the [HTML page](https://019b9fc9-cbf8-b008-71ab-3a23a796c9aa.share.connect.posit.cloud/).\n"
+        "* Check the Machine Learning code in the [HTML page](https://019b9fc6-5626-8f65-e0a1-60f288c3886a.share.connect.posit.cloud/).\n"
+        "* Check the Analytical Report of the Brazilian PCSCs in the [HTML page](https://019b9fc9-cbf8-b008-71ab-3a23a796c9aa.share.connect.posit.cloud/).\n"
         "* Check the code source reporsitory on [Github](https://github.com/arcarvalhojr/sih-sus_analysis_project/tree/main)."
     )
 
