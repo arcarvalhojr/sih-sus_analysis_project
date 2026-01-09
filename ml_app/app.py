@@ -17,13 +17,17 @@ st.markdown(
 
 # side bar
 with st.sidebar:
-    st.image("docs/sus.webp", use_container_width=True)
+    st.header("Risk classification App")
+    st.image("docs/sus.webp")
     st.markdown(
-        """
-        The machine learn model used here was trained on
-        SIH/SUS data from the Brazilian Minitry of Health.
-        """
+        "## How to use\n"
+        "1. Input patient clinical data. \n"
+        "2. Click the prediction button. \n"
+        "3. Check risk classification."
     )
+    st.markdown("---")
+    st.markdown("# About")
+    st.markdown("The machine learn model used here was trained on SIH/SUS data from the Brazilian Minitry of Health.")
 
 # session state
 if "risk_proba" not in st.session_state:
@@ -167,6 +171,16 @@ with tab_summary:
         "docs/shap_summary.png",
         caption="SHAP summary plot (global feature importance)",
         use_container_width=True
+    )
+
+# more information
+# expander
+exp2 = st.expander("More information")
+exp2.markdown(
+        "#### For more information of how this works:\n"
+        "* Check the machine learning code in the [HTML page](https://019b9fc6-5626-8f65-e0a1-60f288c3886a.share.connect.posit.cloud/).\n"
+        "* Check the Analytical report of the PCSCs in the [HTML page](https://019b9fc9-cbf8-b008-71ab-3a23a796c9aa.share.connect.posit.cloud/).\n"
+        "* Check the code source reporsitory on [Github](https://github.com/arcarvalhojr/sih-sus_analysis_project/tree/main)."
     )
 
 
